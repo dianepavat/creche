@@ -1,0 +1,581 @@
+---
+title: "04_akde_space_use_ctmm"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+# Purpose
+
+This script estimates **space use** from retained penguin foraging-trip locations using **continuous-time autocorrelated kernel density estimation (AKDE)** with the `ctmm` package.
+
+This version runs the workflow twice:
+
+1. **Full dataset**: includes all retained trips  
+2. **Trimmed dataset**: excludes trips whose `max_distance_colony_km` exceeds a chosen threshold  
+
+This is the safest structure for your study because it lets you compare whether one rare extended trip materially changes the space-use results.
+
+# Packages
+
+```{r packages}
+library(dplyr)
+library(readr)
+library(lubridate)
+library(ggplot2)
+library(openxlsx)
+library(sf)
+library(sp)
+library(ctmm)
+library(tidyr)
+library(purrr)
+```
+
+# Project folders
+
+```{r folders}
+project_dir <- getwd()
+input_dir <- file.path(project_dir, "outputs", "03_setup_and_load")
+output_dir <- file.path(project_dir, "outputs", "07_akde_space_use_ctmm")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# User controls
+
+```{r user-controls}
+extended_trip_threshold_km <- 250
+land_shp <- NULL
+boundary_buffer_m <- 20000
+estimate_year_mean_ud <- TRUE
+use_weighted_akde <- TRUE
+use_debiased_akde <- TRUE
+ud_levels <- c(0.50, 0.95)
+```
+
+# Helper functions
+
+```{r helpers}
+theme_paper <- function() {
+  theme_minimal() +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(colour = "grey85", linewidth = 0.4),
+      axis.text = element_text(colour = "grey20"),
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5),
+      legend.position = "right"
+    )
+}
+
+extract_ud_area <- function(ud_obj, level_ud) {
+  s <- summary(ud_obj, level.UD = level_ud, units = TRUE)
+  ci_tbl <- as.data.frame(s$CI)
+  ci_tbl$parameter <- rownames(ci_tbl)
+  area_row <- ci_tbl %>% dplyr::filter(parameter == "area")
+  tibble::tibble(
+    ud_level = paste0(level_ud * 100, "%"),
+    area_low = area_row[1, 1],
+    area_est = area_row[1, 2],
+    area_high = area_row[1, 3]
+  )
+}
+```
+
+# Load the analysis-ready inputs
+
+```{r load-inputs}
+tracks <- readRDS(file.path(input_dir, "tracks_clean.rds"))
+trips <- readRDS(file.path(input_dir, "trips_clean.rds"))
+qa <- readRDS(file.path(input_dir, "qa_clean.rds"))
+```
+
+# Keep only points belonging to retained final trips
+
+```{r subset-final-trip-points}
+tracks_trip_points <- tracks %>%
+  filter(!is.na(global_trip_id)) %>%
+  arrange(bird_id, global_trip_id, datetime)
+
+cat("Points in retained final trips:", nrow(tracks_trip_points), "\n")
+cat("Birds represented:", dplyr::n_distinct(tracks_trip_points$bird_id), "\n")
+cat("Trips represented:", dplyr::n_distinct(tracks_trip_points$global_trip_id), "\n")
+```
+
+# Flag extended trips and build both datasets
+
+```{r build-full-and-trimmed-datasets}
+trips <- trips %>%
+  mutate(
+    is_extended_trip = max_distance_colony_km > extended_trip_threshold_km
+  )
+
+extended_trip_ids <- trips %>%
+  filter(is_extended_trip) %>%
+  pull(global_trip_id)
+
+tracks_use_full <- tracks_trip_points
+
+tracks_use_trimmed <- tracks_trip_points %>%
+  filter(!global_trip_id %in% extended_trip_ids)
+
+readr::write_csv(tracks_use_full, file.path(output_dir, "tracks_use_full.csv"))
+readr::write_csv(tracks_use_trimmed, file.path(output_dir, "tracks_use_trimmed.csv"))
+readr::write_csv(trips, file.path(output_dir, "trips_with_extended_flag.csv"))
+
+cat("FULL dataset - points:", nrow(tracks_use_full), "\n")
+cat("FULL dataset - birds:", dplyr::n_distinct(tracks_use_full$bird_id), "\n")
+cat("FULL dataset - trips:", dplyr::n_distinct(tracks_use_full$global_trip_id), "\n\n")
+
+cat("TRIMMED dataset - points:", nrow(tracks_use_trimmed), "\n")
+cat("TRIMMED dataset - birds:", dplyr::n_distinct(tracks_use_trimmed$bird_id), "\n")
+cat("TRIMMED dataset - trips:", dplyr::n_distinct(tracks_use_trimmed$global_trip_id), "\n")
+```
+
+# Build a hard water boundary if a land shapefile is provided
+
+```{r build-boundary}
+# Path to Falklands land polygon shapefile
+land_shp <- "C:/Users/r01dp24/OneDrive - University of Aberdeen/Documents/PhD/05-Data/01 - Shapefile/boundaries/falklands_boundaries.shp"
+
+water_boundary_sp <- NULL
+water_boundary_sf <- NULL
+
+if (!is.null(land_shp)) {
+  
+  # Read land polygons and project them to UTM 21S
+  land_sf <- sf::st_read(land_shp, quiet = TRUE) %>%
+    sf::st_transform(32721)
+  
+  # Convert penguin points to sf and project them to the same CRS
+  pts_sf <- tracks_use_full %>%
+    sf::st_as_sf(coords = c("long", "lat"), crs = 4326) %>%
+    sf::st_transform(32721)
+  
+  # Build a buffered bounding polygon around the tracking extent
+  bbox_poly <- sf::st_as_sfc(sf::st_bbox(pts_sf)) %>%
+    sf::st_buffer(boundary_buffer_m)
+  
+  # Merge all land polygons into one geometry
+  land_union <- sf::st_union(land_sf)
+  
+  # Define water as study extent minus land
+  water_boundary_sf <- sf::st_difference(bbox_poly, land_union)
+  
+  # Convert to Spatial for ctmm
+  water_boundary_sp <- as(sf::st_as_sf(water_boundary_sf), "Spatial")
+}
+
+ggplot() +
+  geom_sf(data = water_boundary_sf, fill = "lightblue", colour = "blue", alpha = 0.4) +
+  geom_sf(data = land_sf, fill = "grey60", colour = "black") +
+  geom_sf(data = pts_sf, size = 0.3, alpha = 0.3) +
+  labs(title = "Water boundary used for AKDE") +
+  theme_minimal()
+```
+
+# Store the two analysis datasets in a list
+
+```{r analysis-dataset-list}
+analysis_datasets <- list(
+  full = tracks_use_full,
+  trimmed = tracks_use_trimmed
+)
+
+names(analysis_datasets)
+```
+
+# Run AKDE workflow for both dataset versions
+
+```{r run-akde-workflow}
+analysis_results <- purrr::imap(
+  analysis_datasets,
+  function(tracks_use, dataset_name) {
+
+    dataset_dir <- file.path(output_dir, dataset_name)
+    dir.create(dataset_dir, recursive = TRUE, showWarnings = FALSE)
+
+    ctmm_input <- tracks_use %>%
+      transmute(
+        individual.local.identifier = bird_id,
+        timestamp = format(datetime, "%Y-%m-%d %H:%M:%S", tz = "UTC"),
+        location.long = long,
+        location.lat = lat,
+        bird_id = bird_id,
+        year_season = year_season
+      )
+
+    tele_list <- ctmm::as.telemetry(
+      ctmm_input,
+      timezone = "UTC"
+    )
+
+    guess_list <- lapply(tele_list, function(dat) {
+      ctmm::ctmm.guess(dat, interactive = FALSE)
+    })
+
+    fit_list <- Map(
+      f = function(dat, guess) ctmm::ctmm.select(dat, guess, trace = 0),
+      dat = tele_list,
+      guess = guess_list
+    )
+    names(fit_list) <- names(tele_list)
+
+    if (is.null(water_boundary_sp)) {
+      ud_list <- ctmm::akde(
+        tele_list,
+        fit_list,
+        weights = use_weighted_akde,
+        debias = use_debiased_akde
+      )
+    } else {
+      ud_list <- ctmm::akde(
+        tele_list,
+        fit_list,
+        weights = use_weighted_akde,
+        debias = use_debiased_akde,
+        SP = water_boundary_sp,
+        SP.in = TRUE
+      )
+    }
+    names(ud_list) <- names(tele_list)
+
+    individual_area_tbl <- purrr::map_dfr(names(ud_list), function(id) {
+      this_year <- tracks_use %>%
+        filter(bird_id == id) %>%
+        summarise(year_season = first(year_season)) %>%
+        pull(year_season)
+
+      out <- purrr::map_dfr(ud_levels, function(lvl) {
+        extract_ud_area(ud_list[[id]], level_ud = lvl)
+      })
+
+      out %>%
+        mutate(
+          dataset_version = dataset_name,
+          bird_id = id,
+          year_season = this_year
+        )
+    }) %>%
+      select(dataset_version, bird_id, year_season, everything())
+
+    individual_area_summary_by_year <- individual_area_tbl %>%
+      group_by(dataset_version, year_season, ud_level) %>%
+      summarise(
+        n_birds = n(),
+        mean_area = mean(area_est, na.rm = TRUE),
+        sd_area = sd(area_est, na.rm = TRUE),
+        min_area = min(area_est, na.rm = TRUE),
+        max_area = max(area_est, na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    year_ud_list <- NULL
+    year_ud_50_sf <- NULL
+    year_ud_95_sf <- NULL
+    year_mean_area_tbl <- NULL
+
+    if (estimate_year_mean_ud) {
+      bird_year_tbl <- tracks_use %>%
+        distinct(bird_id, year_season)
+
+      year_ud_list <- split(
+        ud_list,
+        bird_year_tbl$year_season[match(names(ud_list), bird_year_tbl$bird_id)]
+      )
+
+      year_ud_list <- lapply(year_ud_list, function(x) {
+        mean(x)
+      })
+
+      year_ud_50_sf <- purrr::imap_dfr(year_ud_list, function(ud_obj, yr) {
+        out <- ctmm::as.sf(ud_obj, level.UD = 0.50)
+        out$year_season <- yr
+        out$dataset_version <- dataset_name
+        out
+      })
+
+      year_ud_95_sf <- purrr::imap_dfr(year_ud_list, function(ud_obj, yr) {
+        out <- ctmm::as.sf(ud_obj, level.UD = 0.95)
+        out$year_season <- yr
+        out$dataset_version <- dataset_name
+        out
+      })
+
+      year_mean_area_tbl <- purrr::imap_dfr(year_ud_list, function(ud_obj, yr) {
+        purrr::map_dfr(ud_levels, function(lvl) {
+          extract_ud_area(ud_obj, level_ud = lvl) %>%
+            mutate(
+              dataset_version = dataset_name,
+              year_season = yr
+            )
+        })
+      }) %>%
+        select(dataset_version, year_season, everything())
+    }
+
+    readr::write_csv(individual_area_tbl, file.path(dataset_dir, "individual_akde_area_table.csv"))
+    readr::write_csv(individual_area_summary_by_year, file.path(dataset_dir, "individual_akde_area_summary_by_year.csv"))
+
+    if (!is.null(year_mean_area_tbl)) {
+      readr::write_csv(year_mean_area_tbl, file.path(dataset_dir, "year_mean_akde_area_table.csv"))
+    }
+
+    if (!is.null(year_ud_50_sf)) {
+      sf::write_sf(
+        year_ud_50_sf,
+        file.path(dataset_dir, "year_mean_ud_50.gpkg"),
+        delete_dsn = TRUE
+      )
+    }
+
+    if (!is.null(year_ud_95_sf)) {
+      sf::write_sf(
+        year_ud_95_sf,
+        file.path(dataset_dir, "year_mean_ud_95.gpkg"),
+        delete_dsn = TRUE
+      )
+    }
+
+    saveRDS(fit_list, file.path(dataset_dir, "ctmm_fit_list.rds"))
+    saveRDS(ud_list, file.path(dataset_dir, "ctmm_ud_list.rds"))
+
+    if (!is.null(year_ud_list)) {
+      saveRDS(year_ud_list, file.path(dataset_dir, "ctmm_year_mean_ud_list.rds"))
+    }
+
+    wb <- openxlsx::createWorkbook()
+    openxlsx::addWorksheet(wb, "individual_area_table")
+    openxlsx::writeData(wb, "individual_area_table", individual_area_tbl)
+    openxlsx::addWorksheet(wb, "individual_area_summary")
+    openxlsx::writeData(wb, "individual_area_summary", individual_area_summary_by_year)
+
+    if (!is.null(year_mean_area_tbl)) {
+      openxlsx::addWorksheet(wb, "year_mean_area_table")
+      openxlsx::writeData(wb, "year_mean_area_table", year_mean_area_tbl)
+    }
+
+    openxlsx::saveWorkbook(
+      wb,
+      file.path(dataset_dir, paste0("04_akde_outputs_", dataset_name, ".xlsx")),
+      overwrite = TRUE
+    )
+
+    list(
+      individual_area_tbl = individual_area_tbl,
+      individual_area_summary_by_year = individual_area_summary_by_year,
+      year_ud_50_sf = year_ud_50_sf,
+      year_ud_95_sf = year_ud_95_sf,
+      year_mean_area_tbl = year_mean_area_tbl
+    )
+  }
+)
+```
+
+# Combine area tables across the two dataset versions
+
+```{r combine-results}
+combined_individual_area_tbl <- bind_rows(
+  analysis_results$full$individual_area_tbl,
+  analysis_results$trimmed$individual_area_tbl
+)
+
+combined_individual_area_summary_by_year <- bind_rows(
+  analysis_results$full$individual_area_summary_by_year,
+  analysis_results$trimmed$individual_area_summary_by_year
+)
+
+combined_year_mean_area_tbl <- bind_rows(
+  analysis_results$full$year_mean_area_tbl,
+  analysis_results$trimmed$year_mean_area_tbl
+)
+
+combined_individual_area_tbl
+combined_individual_area_summary_by_year
+combined_year_mean_area_tbl
+```
+
+# Figures: compare individual AKDE area by year and dataset version
+
+```{r figures-area}
+fig_individual_area <- ggplot(
+  combined_individual_area_tbl,
+  aes(x = year_season, y = area_est, fill = ud_level)
+) +
+  geom_boxplot() +
+  facet_wrap(~ dataset_version) +
+  labs(
+    title = "Individual AKDE area by year",
+    subtitle = "Comparison of full and trimmed datasets",
+    x = "Year",
+    y = "Area estimate",
+    fill = "UD level"
+  ) +
+  theme_paper()
+
+fig_individual_area
+```
+
+# Figures: compare year-level mean UD polygons
+
+```{r figures-year-ud}
+fig_year_ud <- NULL
+
+year_ud_50_all <- bind_rows(
+  analysis_results$full$year_ud_50_sf,
+  analysis_results$trimmed$year_ud_50_sf
+)
+
+year_ud_95_all <- bind_rows(
+  analysis_results$full$year_ud_95_sf,
+  analysis_results$trimmed$year_ud_95_sf
+)
+
+if (!is.null(year_ud_50_all) && !is.null(year_ud_95_all) &&
+    nrow(year_ud_50_all) > 0 && nrow(year_ud_95_all) > 0) {
+
+  fig_year_ud <- ggplot() +
+    geom_sf(data = year_ud_95_all, fill = "grey70", alpha = 0.4, colour = "grey30") +
+    geom_sf(data = year_ud_50_all, fill = "red", alpha = 0.5, colour = "red4") +
+    facet_grid(dataset_version ~ year_season) +
+    labs(
+      title = "Year-level mean AKDE utilisation distributions",
+      subtitle = "95% UD in grey, 50% UD in red",
+      x = "Easting / Longitude",
+      y = "Northing / Latitude"
+    ) +
+    theme_paper()
+
+  fig_year_ud
+}
+```
+
+# Save combined figures
+
+```{r save-figures}
+ggsave(
+  file.path(output_dir, "fig_individual_akde_area_by_year_full_vs_trimmed.png"),
+  fig_individual_area,
+  width = 9,
+  height = 5,
+  dpi = 300
+)
+
+if (!is.null(fig_year_ud)) {
+  ggsave(
+    file.path(output_dir, "fig_year_mean_akde_ud_full_vs_trimmed.png"),
+    fig_year_ud,
+    width = 10,
+    height = 7,
+    dpi = 300
+  )
+}
+```
+
+# Save combined tables
+
+```{r save-combined-tables}
+readr::write_csv(land_crossing_tbl, file.path(output_dir, "land_crossing_diagnostic.csv"))
+readr::write_csv(combined_individual_area_tbl, file.path(output_dir, "combined_individual_akde_area_table.csv"))
+readr::write_csv(combined_individual_area_summary_by_year, file.path(output_dir, "combined_individual_akde_area_summary_by_year.csv"))
+
+if (!is.null(combined_year_mean_area_tbl) && nrow(combined_year_mean_area_tbl) > 0) {
+  readr::write_csv(combined_year_mean_area_tbl, file.path(output_dir, "combined_year_mean_akde_area_table.csv"))
+}
+```
+
+# Save combined workbook
+
+```{r workbook}
+wb <- openxlsx::createWorkbook()
+
+openxlsx::addWorksheet(wb, "land_crossing_diagnostic")
+openxlsx::writeData(wb, "land_crossing_diagnostic", land_crossing_tbl)
+
+openxlsx::addWorksheet(wb, "combined_individual_area")
+openxlsx::writeData(wb, "combined_individual_area", combined_individual_area_tbl)
+
+openxlsx::addWorksheet(wb, "combined_area_summary")
+openxlsx::writeData(wb, "combined_area_summary", combined_individual_area_summary_by_year)
+
+if (!is.null(combined_year_mean_area_tbl) && nrow(combined_year_mean_area_tbl) > 0) {
+  openxlsx::addWorksheet(wb, "combined_year_mean_area")
+  openxlsx::writeData(wb, "combined_year_mean_area", combined_year_mean_area_tbl)
+}
+
+openxlsx::saveWorkbook(
+  wb,
+  file.path(output_dir, "04_akde_space_use_ctmm_full_vs_trimmed_outputs.xlsx"),
+  overwrite = TRUE
+)
+```
+
+# Interpretation summary
+
+```{r interpretation-summary, results='asis'}
+cat("## Interpretation of AKDE outputs
+
+")
+
+cat(
+  "This analysis estimated space use using **autocorrelated kernel density estimation (AKDE)**, ",
+  "which is designed for tracking data that are irregular in time and autocorrelated. ",
+  "The workflow was run twice: once on the **full dataset** and once on a **trimmed dataset** excluding trips with maximum range greater than **",
+  extended_trip_threshold_km,
+  " km**.
+
+",
+  sep = ""
+)
+
+cat(
+  "At the individual level, the **95% UD** represents the broader overall space used by each bird, ",
+  "whereas the **50% UD** represents the more intensively used core area. ",
+  "Comparing the full and trimmed versions allows you to assess whether a rare extended trip strongly changes the area estimates.
+
+",
+  sep = ""
+)
+
+cat(
+  "If year-level mean UDs were estimated, these surfaces represent an average utilisation distribution across birds within each year. ",
+  "This is generally more defensible than pooling all raw points directly, because it reduces bias from individuals with disproportionate sample sizes.
+
+",
+  sep = ""
+)
+
+cat(
+  "If a land shapefile was provided, the UDs were constrained to water using a hard spatial boundary. ",
+  "That is preferable to manually rerouting tracks, because rerouted paths are not themselves statistical models and can imply unrealistic movement. ",
+  "The hard-boundary AKDE lets the space-use model respect the penguins' inability to cross land.
+
+",
+  sep = ""
+)
+
+cat(
+  "The main comparison of interest is whether the **full** and **trimmed** results tell the same ecological story. ",
+  "If they do, your conclusions are robust. ",
+  "If they differ strongly, then the extended trip is an important but rare behaviour that should be discussed explicitly rather than silently removed.
+"
+)
+```
+
+# End
+
+```{r end}
+cat("04_akde_space_use_ctmm_full_and_trimmed completed successfully.
+")
+cat("Outputs saved in:", output_dir, "
+")
+```

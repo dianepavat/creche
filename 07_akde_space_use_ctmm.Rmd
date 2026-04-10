@@ -1,0 +1,571 @@
+---
+title: "Untitled"
+author: "Diane Pavat"
+date: "2026-03-31"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+# Purpose
+
+This script estimates **space use** from retained penguin foraging-trip locations using **continuous-time autocorrelated kernel density estimation (AKDE)** with the `ctmm` package.
+
+This is intentionally a step up from a simple classical KDE workflow because your data have two important features:
+
+1. sampling may be **irregular in time**
+2. locations are **autocorrelated**, as all movement data are
+
+AKDE is designed to account for those issues directly, so it is generally more defensible than a basic KDE when working with animal tracking data.
+
+This script does the following:
+
+1. loads the clean tracking and trip objects
+2. keeps only retained trip points
+3. optionally excludes very extended trips for sensitivity analysis
+4. converts the data to `ctmm` telemetry objects
+5. fits individual continuous-time movement models
+6. estimates individual AKDE home ranges
+7. summarises **50%** and **95%** space-use areas
+8. optionally builds **year-level mean UDs**
+9. optionally constrains UDs to water using a hard boundary built from a land shapefile
+10. saves outputs, figures, and interpretation text
+
+# Why this workflow
+
+This workflow is based on current best practice for irregular telemetry data.
+
+The `ctmm::akde()` documentation states that AKDE calculates autocorrelated kernel density estimates from telemetry data and fitted continuous-time movement models, supports **hard boundaries** through the `SP` argument, and can **optimally weight** observations to account for sampling bias. It also explicitly cites work correcting for **missing and irregular data** in home-range estimation.
+
+The ctmm AKDE vignette also notes that **irregular sampling** is a good use case for **weighted AKDE** (`weights=TRUE`), because uniformly weighted estimates can over-emphasise oversampled periods.
+
+For marine animals crossing coastal landscapes, `{pathroutr}` is explicitly designed to reroute paths that cross land barriers, but its documentation also warns that rerouted paths are **not statistical models** and can introduce biases or imply unrealistic speeds. For a space-use analysis, that makes **boundary-constrained AKDE** preferable to manually rerouting the tracks themselves.
+
+# Packages
+
+```{r packages}
+library(dplyr)
+library(readr)
+library(lubridate)
+library(ggplot2)
+library(openxlsx)
+library(sf)
+library(sp)
+library(ctmm)
+library(tidyr)
+library(purrr)
+```
+
+# Project folders
+
+```{r folders}
+project_dir <- getwd()
+input_dir <- file.path(project_dir, "outputs", "03_setup_and_load")
+output_dir <- file.path(project_dir, "outputs", "07_akde_space_use_ctmm")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# User controls
+
+```{r user-controls}
+exclude_extended_trips <- FALSE
+extended_trip_threshold_km <- 250
+land_shp <- NULL
+boundary_buffer_m <- 20000
+estimate_year_mean_ud <- TRUE
+use_weighted_akde <- TRUE
+use_debiased_akde <- TRUE
+ud_levels <- c(0.50, 0.95)
+```
+
+# Helper functions
+
+```{r helpers}
+theme_paper <- function() {
+  theme_minimal() +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(colour = "grey85", linewidth = 0.4),
+      axis.text = element_text(colour = "grey20"),
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5),
+      legend.position = "right"
+    )
+}
+
+extract_ud_area <- function(ud_obj, level_ud) {
+  s <- summary(ud_obj, level.UD = level_ud, units = TRUE)
+  ci_tbl <- as.data.frame(s$CI)
+  ci_tbl$parameter <- rownames(ci_tbl)
+  area_row <- ci_tbl %>% dplyr::filter(parameter == "area")
+  tibble::tibble(
+    ud_level = paste0(level_ud * 100, "%"),
+    area_low = area_row[1, 1],
+    area_est = area_row[1, 2],
+    area_high = area_row[1, 3]
+  )
+}
+```
+
+# Load the analysis-ready inputs
+
+```{r load-inputs}
+tracks <- readRDS(file.path(input_dir, "tracks_clean.rds"))
+trips <- readRDS(file.path(input_dir, "trips_clean.rds"))
+qa <- readRDS(file.path(input_dir, "qa_clean.rds"))
+```
+
+# Keep only points belonging to retained final trips
+
+```{r subset-final-trip-points}
+tracks_trip_points <- tracks %>%
+  filter(!is.na(global_trip_id)) %>%
+  arrange(bird_id, global_trip_id, datetime)
+
+cat("Points in retained final trips:", nrow(tracks_trip_points), "\n")
+cat("Birds represented:", dplyr::n_distinct(tracks_trip_points$bird_id), "\n")
+cat("Trips represented:", dplyr::n_distinct(tracks_trip_points$global_trip_id), "\n")
+```
+
+# Optionally exclude extended trips
+
+```{r optional-extended-trip-filter}
+trips <- trips %>%
+  mutate(
+    is_extended_trip = max_distance_colony_km > extended_trip_threshold_km
+  )
+
+extended_trip_ids <- trips %>%
+  filter(is_extended_trip) %>%
+  pull(global_trip_id)
+
+tracks_use <- tracks_trip_points
+
+if (exclude_extended_trips) {
+  tracks_use <- tracks_use %>%
+    filter(!global_trip_id %in% extended_trip_ids)
+}
+
+cat("Points used in AKDE workflow:", nrow(tracks_use), "\n")
+cat("Birds used in AKDE workflow:", dplyr::n_distinct(tracks_use$bird_id), "\n")
+```
+
+# Build a hard water boundary if a land shapefile is provided
+
+```{r build-boundary}
+water_boundary_sp <- NULL
+
+if (!is.null(land_shp)) {
+  land_sf <- sf::st_read(land_shp, quiet = TRUE) %>%
+    sf::st_transform(32721)
+
+  pts_sf <- tracks_use %>%
+    sf::st_as_sf(coords = c("long", "lat"), crs = 4326) %>%
+    sf::st_transform(32721)
+
+  bbox_poly <- sf::st_as_sfc(sf::st_bbox(pts_sf)) %>%
+    sf::st_buffer(boundary_buffer_m)
+
+  land_union <- sf::st_union(land_sf)
+  water_poly <- sf::st_difference(bbox_poly, land_union)
+
+  water_boundary_sp <- as(sf::st_as_sf(water_poly), "Spatial")
+}
+```
+
+# Optional diagnostic: count segments that intersect land
+
+```{r land-crossing-diagnostic}
+land_crossing_count <- NA_integer_
+
+if (!is.null(land_shp)) {
+  land_sf <- sf::st_read(land_shp, quiet = TRUE) %>%
+    sf::st_transform(32721)
+
+  seg_tbl <- tracks_use %>%
+    arrange(bird_id, datetime) %>%
+    group_by(bird_id) %>%
+    mutate(
+      long_next = lead(long),
+      lat_next = lead(lat)
+    ) %>%
+    ungroup() %>%
+    filter(!is.na(long_next), !is.na(lat_next))
+
+  if (nrow(seg_tbl) > 0) {
+    seg_lines <- lapply(seq_len(nrow(seg_tbl)), function(i) {
+      m <- matrix(
+        c(seg_tbl$long[i], seg_tbl$lat[i],
+          seg_tbl$long_next[i], seg_tbl$lat_next[i]),
+        ncol = 2,
+        byrow = TRUE
+      )
+      sf::st_linestring(m)
+    })
+
+    seg_sf <- sf::st_sf(
+      geometry = sf::st_sfc(seg_lines, crs = 4326)
+    ) %>%
+      sf::st_transform(32721)
+
+    land_crossing_count <- sum(lengths(sf::st_intersects(seg_sf, land_sf)) > 0)
+  }
+}
+
+land_crossing_tbl <- tibble::tibble(
+  land_boundary_used = !is.null(land_shp),
+  n_segments_crossing_land = land_crossing_count
+)
+
+land_crossing_tbl
+```
+
+# Prepare Movebank-style input for `ctmm::as.telemetry()`
+
+```{r prepare-telemetry-input}
+ctmm_input <- tracks_use %>%
+  transmute(
+    individual.local.identifier = bird_id,
+    timestamp = format(datetime, "%Y-%m-%d %H:%M:%S", tz = "UTC"),
+    location.long = long,
+    location.lat = lat,
+    bird_id = bird_id,
+    year_season = year_season
+  )
+```
+
+# Convert to telemetry objects
+
+```{r as-telemetry}
+tele_list <- ctmm::as.telemetry(
+  ctmm_input,
+  timezone = "UTC"
+)
+
+length(tele_list)
+names(tele_list)
+```
+
+# Fit individual continuous-time movement models
+
+```{r fit-ctmm-models}
+guess_list <- lapply(tele_list, function(dat) {
+  ctmm::ctmm.guess(dat, interactive = FALSE)
+})
+
+fit_list <- Map(
+  f = function(dat, guess) ctmm::ctmm.select(dat, guess, trace = 0),
+  dat = tele_list,
+  guess = guess_list
+)
+
+names(fit_list) <- names(tele_list)
+```
+
+# Estimate individual AKDEs
+
+```{r estimate-individual-akde}
+if (is.null(water_boundary_sp)) {
+  ud_list <- ctmm::akde(
+    tele_list,
+    fit_list,
+    weights = use_weighted_akde,
+    debias = use_debiased_akde
+  )
+} else {
+  ud_list <- ctmm::akde(
+    tele_list,
+    fit_list,
+    weights = use_weighted_akde,
+    debias = use_debiased_akde,
+    SP = water_boundary_sp,
+    SP.in = TRUE
+  )
+}
+
+names(ud_list) <- names(tele_list)
+```
+
+# Summarise individual 50% and 95% areas
+
+```{r summarise-individual-areas}
+individual_area_tbl <- purrr::map_dfr(names(ud_list), function(id) {
+
+  this_year <- tracks_use %>%
+    filter(bird_id == id) %>%
+    summarise(year_season = first(year_season)) %>%
+    pull(year_season)
+
+  out <- purrr::map_dfr(ud_levels, function(lvl) {
+    extract_ud_area(ud_list[[id]], level_ud = lvl)
+  })
+
+  out %>%
+    mutate(
+      bird_id = id,
+      year_season = this_year
+    )
+}) %>%
+  select(bird_id, year_season, everything())
+
+individual_area_tbl
+```
+
+# Summarise individual areas by year
+
+```{r summarise-by-year}
+individual_area_summary_by_year <- individual_area_tbl %>%
+  group_by(year_season, ud_level) %>%
+  summarise(
+    n_birds = n(),
+    mean_area = mean(area_est, na.rm = TRUE),
+    sd_area = sd(area_est, na.rm = TRUE),
+    min_area = min(area_est, na.rm = TRUE),
+    max_area = max(area_est, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+individual_area_summary_by_year
+```
+
+# Estimate year-level mean UDs
+
+```{r year-mean-uds}
+year_ud_list <- NULL
+
+if (estimate_year_mean_ud) {
+  bird_year_tbl <- tracks_use %>%
+    distinct(bird_id, year_season)
+
+  year_ud_list <- split(
+    ud_list,
+    bird_year_tbl$year_season[match(names(ud_list), bird_year_tbl$bird_id)]
+  )
+
+  year_ud_list <- lapply(year_ud_list, function(x) {
+    mean(x)
+  })
+}
+```
+
+# Extract year-level 50% and 95% polygons
+
+```{r year-level-polygons}
+year_ud_50_sf <- NULL
+year_ud_95_sf <- NULL
+
+if (!is.null(year_ud_list)) {
+  year_ud_50_sf <- purrr::imap_dfr(year_ud_list, function(ud_obj, yr) {
+    out <- ctmm::as.sf(ud_obj, level.UD = 0.50)
+    out$year_season <- yr
+    out
+  })
+
+  year_ud_95_sf <- purrr::imap_dfr(year_ud_list, function(ud_obj, yr) {
+    out <- ctmm::as.sf(ud_obj, level.UD = 0.95)
+    out$year_season <- yr
+    out
+  })
+}
+```
+
+# Year-level mean UD areas
+
+```{r year-level-areas}
+year_mean_area_tbl <- NULL
+
+if (!is.null(year_ud_list)) {
+  year_mean_area_tbl <- purrr::imap_dfr(year_ud_list, function(ud_obj, yr) {
+    purrr::map_dfr(ud_levels, function(lvl) {
+      extract_ud_area(ud_obj, level_ud = lvl) %>%
+        mutate(year_season = yr)
+    })
+  }) %>%
+    select(year_season, everything())
+}
+
+year_mean_area_tbl
+```
+
+# Figures: individual AKDE area by year
+
+```{r figures-area}
+fig_individual_area <- ggplot(individual_area_tbl, aes(x = year_season, y = area_est, fill = ud_level)) +
+  geom_boxplot() +
+  labs(
+    title = "Individual AKDE area by year",
+    subtitle = "Estimated from individual bird AKDEs",
+    x = "Year",
+    y = "Area estimate",
+    fill = "UD level"
+  ) +
+  theme_paper()
+
+fig_individual_area
+```
+
+# Figures: year-level mean UD polygons
+
+```{r figures-year-ud}
+fig_year_ud <- NULL
+
+if (!is.null(year_ud_50_sf) && !is.null(year_ud_95_sf)) {
+  fig_year_ud <- ggplot() +
+    geom_sf(data = year_ud_95_sf, fill = "grey70", alpha = 0.4, colour = "grey30") +
+    geom_sf(data = year_ud_50_sf, fill = "red", alpha = 0.5, colour = "red4") +
+    facet_wrap(~ year_season) +
+    labs(
+      title = "Year-level mean AKDE utilisation distributions",
+      subtitle = "95% UD in grey, 50% UD in red",
+      x = "Easting / Longitude",
+      y = "Northing / Latitude"
+    ) +
+    theme_paper()
+
+  fig_year_ud
+}
+```
+
+# Save figures
+
+```{r save-figures}
+ggsave(
+  file.path(output_dir, "fig_individual_akde_area_by_year.png"),
+  fig_individual_area,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+if (!is.null(fig_year_ud)) {
+  ggsave(
+    file.path(output_dir, "fig_year_mean_akde_ud.png"),
+    fig_year_ud,
+    width = 9,
+    height = 5,
+    dpi = 300
+  )
+}
+```
+
+# Save tables
+
+```{r save-tables}
+readr::write_csv(land_crossing_tbl, file.path(output_dir, "land_crossing_diagnostic.csv"))
+readr::write_csv(individual_area_tbl, file.path(output_dir, "individual_akde_area_table.csv"))
+readr::write_csv(individual_area_summary_by_year, file.path(output_dir, "individual_akde_area_summary_by_year.csv"))
+
+if (!is.null(year_mean_area_tbl)) {
+  readr::write_csv(year_mean_area_tbl, file.path(output_dir, "year_mean_akde_area_table.csv"))
+}
+```
+
+# Save spatial outputs
+
+```{r save-spatial-outputs}
+if (!is.null(year_ud_50_sf)) {
+  sf::write_sf(
+    year_ud_50_sf,
+    file.path(output_dir, "year_mean_ud_50.gpkg"),
+    delete_dsn = TRUE
+  )
+}
+
+if (!is.null(year_ud_95_sf)) {
+  sf::write_sf(
+    year_ud_95_sf,
+    file.path(output_dir, "year_mean_ud_95.gpkg"),
+    delete_dsn = TRUE
+  )
+}
+```
+
+# Save model objects
+
+```{r save-model-objects}
+saveRDS(fit_list, file.path(output_dir, "ctmm_fit_list.rds"))
+saveRDS(ud_list, file.path(output_dir, "ctmm_ud_list.rds"))
+
+if (!is.null(year_ud_list)) {
+  saveRDS(year_ud_list, file.path(output_dir, "ctmm_year_mean_ud_list.rds"))
+}
+```
+
+# Save workbook
+
+```{r workbook}
+wb <- openxlsx::createWorkbook()
+
+openxlsx::addWorksheet(wb, "land_crossing_diagnostic")
+openxlsx::writeData(wb, "land_crossing_diagnostic", land_crossing_tbl)
+
+openxlsx::addWorksheet(wb, "individual_area_table")
+openxlsx::writeData(wb, "individual_area_table", individual_area_tbl)
+
+openxlsx::addWorksheet(wb, "individual_area_summary")
+openxlsx::writeData(wb, "individual_area_summary", individual_area_summary_by_year)
+
+if (!is.null(year_mean_area_tbl)) {
+  openxlsx::addWorksheet(wb, "year_mean_area_table")
+  openxlsx::writeData(wb, "year_mean_area_table", year_mean_area_tbl)
+}
+
+openxlsx::saveWorkbook(
+  wb,
+  file.path(output_dir, "04_akde_space_use_ctmm_outputs.xlsx"),
+  overwrite = TRUE
+)
+```
+
+# Interpretation summary
+
+```{r interpretation-summary, results='asis'}
+cat("## Interpretation of AKDE outputs\n\n")
+
+cat(
+  "This analysis estimated space use using **autocorrelated kernel density estimation (AKDE)**, ",
+  "which is designed for tracking data that are irregular in time and autocorrelated. ",
+  "Unlike a simple KDE, AKDE uses a fitted continuous-time movement model and therefore better respects the structure of animal movement data.\n\n",
+  sep = ""
+)
+
+cat(
+  "At the individual level, the **95% UD** can be interpreted as the overall space used by each bird, ",
+  "whereas the **50% UD** represents the more intensively used core area. ",
+  "The individual-area tables therefore allow you to compare overall and core-use area between years while preserving the individual-bird structure.\n\n",
+  sep = ""
+)
+
+cat(
+  "If year-level mean UDs were estimated, these represent an average utilisation surface across birds within a year. ",
+  "This is often more appropriate than pooling all raw points directly, because it reduces bias from birds with disproportionate sample sizes.\n\n",
+  sep = ""
+)
+
+cat(
+  "If a land shapefile was provided, the AKDEs were constrained to the inferred water boundary using a hard spatial boundary. ",
+  "This is preferable to manually rerouting tracks, because rerouted paths are not themselves statistical models and can introduce unrealistic behaviour.\n\n",
+  sep = ""
+)
+
+cat(
+  "These outputs should still be interpreted with care. ",
+  "AKDE handles autocorrelation and irregular sampling more appropriately than a basic KDE, but results can still depend on track length, sample size, and whether very extended trips are included. ",
+  "For that reason, it is good practice to compare full and sensitivity versions of the analysis.\n"
+)
+```
+
+# End
+
+```{r end}
+cat("04_akde_space_use_ctmm completed successfully.\n")
+cat("Outputs saved in:", output_dir, "\n")
+```
+

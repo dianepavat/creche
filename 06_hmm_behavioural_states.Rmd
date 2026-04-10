@@ -1,0 +1,712 @@
+---
+title: "06_hmm_behavioural_states"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+# Show code in the knitted report, but suppress warnings/messages for readability.
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+# Purpose
+
+This script fits a **2-state Hidden Markov Model (HMM)** to the retained rockhopper foraging trips.
+
+This version has been rebuilt to follow the standard logic taught in movement-analysis workflows:
+
+1. inspect the sampling structure  
+2. evaluate candidate regular time resolutions  
+3. split tracks at long gaps  
+4. thin / regularise the data to a chosen interval  
+5. derive step length and turning angle from the regularised data  
+6. fit the HMM and decode behavioural states  
+
+This is important because discrete-time HMMs are much easier to interpret when location data are approximately regular in time.
+
+This script is designed to give you **control** over key preprocessing choices:
+- candidate thinning resolutions
+- final chosen resolution
+- maximum allowed gap before splitting
+- minimum retained subtrack duration
+
+# Packages
+
+```{r packages}
+library(dplyr)        # data manipulation
+library(readr)        # csv writing
+library(lubridate)    # date-time handling and rounding
+library(ggplot2)      # plotting
+library(openxlsx)     # Excel outputs
+library(momentuHMM)   # HMM fitting and movement preprocessing
+library(tidyr)        # reshaping data
+```
+
+# Project folders
+
+```{r folders}
+# Use the current working directory as the project root.
+project_dir <- getwd()
+
+# Folder containing the analysis-ready objects from script 00.
+input_dir <- file.path(project_dir, "outputs", "03_setup_and_load")
+
+# Output folder for this script.
+output_dir <- file.path(project_dir, "outputs", "06_hmm_behavioural_states")
+
+# Create the output folder if needed.
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# User controls
+
+```{r user-controls}
+# Candidate thinning resolutions (in minutes) to evaluate before selecting one.
+candidate_resolutions_min <- c(5, 10, 15, 20, 30, 60)
+
+# Final thinning resolution used for the HMM.
+# Change this value after inspecting the resolution-evaluation outputs.
+hmm_res_min <- 15
+
+# Maximum allowed gap (in minutes) before a track is split into subtracks.
+max_gap_min <- 60
+
+# Minimum duration (in minutes) required for a subtrack to be retained after splitting.
+min_subtrack_duration_min <- 60
+
+# Number of HMM states.
+nbStates <- 2
+```
+
+# Helper functions
+
+```{r helpers}
+# Simple plotting theme used throughout the script.
+theme_paper <- function() {
+  theme_minimal() +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(colour = "grey85", linewidth = 0.4),
+      axis.text = element_text(colour = "grey20"),
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5),
+      legend.position = "right"
+    )
+}
+
+# -------------------------------------------------------------------
+# Split tracks at large time gaps
+# -------------------------------------------------------------------
+split_at_gap <- function(data, max_gap = 60, shortest_track = 0) {
+  n_tracks <- length(unique(data$ID))                       # number of original tracks
+
+  data$ID_old <- data$ID                                    # keep original track ID
+  data$ID <- character(nrow(data))                          # initialise new split-track ID
+
+  for(i_track in 1:n_tracks) {
+    ind_this_track <- which(data$ID_old == unique(data$ID_old)[i_track])  # indices of this track
+    track_length <- length(ind_this_track)                                 # number of rows in this track
+
+    dtimes <- difftime(                                                    # consecutive time gaps in minutes
+      data$time[ind_this_track[-1]],
+      data$time[ind_this_track[-track_length]],
+      units = "mins"
+    )
+
+    ind_gap <- c(0, which(dtimes > max_gap), track_length)                 # locations of large gaps
+
+    subtrack_ID <- rep(1:(length(ind_gap) - 1), diff(ind_gap))             # assign subtrack number
+    data$ID[ind_this_track] <- paste0(data$ID_old[ind_this_track], "-", subtrack_ID)
+  }
+
+  track_lengths <- sapply(unique(data$ID), function(id) {                  # calculate duration of each subtrack
+    ind <- which(data$ID == id)
+    difftime(data$time[ind[length(ind)]], data$time[ind[1]], units = "min")
+  })
+
+  ID_keep <- names(track_lengths)[which(track_lengths >= shortest_track)]  # keep only long-enough subtracks
+  data <- subset(data, ID %in% ID_keep)
+
+  return(data)
+}
+
+# -------------------------------------------------------------------
+# Estimate the proportion of missing locations that would occur for a chosen resolution
+# -------------------------------------------------------------------
+p_na <- function(time, res) {
+  time <- round_date(time, paste(res, "min"))                              # round timestamps to the chosen resolution
+  time <- na.omit(time[time != dplyr::lead(time)])                         # remove duplicate rounded times
+  max_n_loc <- length(seq(time[1], tail(time, 1) + res * 60,               # theoretical maximum number of locations
+                          by = as.difftime(res, units = "mins")))
+  n_NA <- max_n_loc - (length(time) + 1)                                   # missing observations implied by the chosen resolution
+  n_NA / max_n_loc                                                         # proportion missing
+}
+```
+
+# Load the analysis-ready inputs
+
+```{r load-inputs}
+tracks <- readRDS(file.path(input_dir, "tracks_clean.rds"))                # point-level tracking object
+trips <- readRDS(file.path(input_dir, "trips_clean.rds"))                  # trip-level object
+qa <- readRDS(file.path(input_dir, "qa_clean.rds"))                        # QA object
+```
+
+# Keep only points belonging to retained final trips
+
+```{r subset-final-trip-points}
+tracks_trip_points <- tracks %>%
+  filter(!is.na(global_trip_id)) %>%                                       # keep only retained trip points
+  arrange(bird_id, global_trip_id, datetime) %>%
+  rename(ID = global_trip_id)
+
+cat("Points in final retained trips:", nrow(tracks_trip_points), "\n")
+cat("Trips represented in point data:", dplyr::n_distinct(tracks_trip_points$ID), "\n")
+```
+
+# Build the base HMM table
+
+```{r base-hmm-table}
+# Build a clean table with the variables needed for resolution testing and HMM input.
+hmm_base <- tracks_trip_points %>%
+  transmute(
+    ID = ID,                                                   # each retained trip is an initial HMM track
+    bird_id = bird_id,
+    deploymentid = deploymentid,
+    tagnumber = tagnumber,
+    year_season = year_season,
+    time = time,                                                       # helper expects a column called "time"
+    x = long,
+    y = lat
+  ) %>%
+  arrange(ID, time)
+```
+
+# Evaluate candidate thinning resolutions
+
+```{r evaluate-resolutions}
+# Estimate missingness for each candidate resolution within each trip.
+resolution_eval <- tidyr::expand_grid(
+  ID = unique(hmm_base$ID),
+  res_min = candidate_resolutions_min
+) %>%
+  left_join(
+    hmm_base %>%
+      group_by(ID) %>%
+      summarise(
+        n_points = n(),
+        start_time = min(time),
+        end_time = max(time),
+        .groups = "drop"
+      ),
+    by = "ID"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    prop_missing = p_na(
+      time = hmm_base$time[hmm_base$ID == ID],
+      res = res_min
+    )
+  ) %>%
+  ungroup()
+
+# Summarise candidate resolutions across trips.
+resolution_summary <- resolution_eval %>%
+  group_by(res_min) %>%
+  summarise(
+    n_tracks = n(),
+    mean_prop_missing = mean(prop_missing, na.rm = TRUE),
+    median_prop_missing = median(prop_missing, na.rm = TRUE),
+    max_prop_missing = max(prop_missing, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+resolution_summary
+```
+
+# Plot resolution diagnostics
+
+```{r resolution-figures}
+fig_resolution <- ggplot(resolution_summary, aes(x = factor(res_min), y = mean_prop_missing)) +
+  geom_col() +
+  labs(
+    title = "Mean proportion of missing locations by candidate resolution",
+    x = "Candidate resolution (minutes)",
+    y = "Mean proportion missing"
+  ) +
+  theme_paper()
+
+fig_resolution_box <- ggplot(resolution_eval, aes(x = factor(res_min), y = prop_missing)) +
+  geom_boxplot() +
+  labs(
+    title = "Distribution of implied missingness across tracks",
+    x = "Candidate resolution (minutes)",
+    y = "Proportion missing"
+  ) +
+  theme_paper()
+
+fig_resolution
+fig_resolution_box
+```
+
+# Split tracks at large gaps
+
+```{r split-at-gaps}
+# Split tracks at large time gaps before thinning.
+# This avoids forcing one HMM state process across biologically disconnected segments.
+hmm_split <- split_at_gap(
+  data = hmm_base,
+  max_gap = max_gap_min,
+  shortest_track = min_subtrack_duration_min
+) %>%
+  arrange(ID, time)
+
+cat("Original number of retained trips:", dplyr::n_distinct(hmm_base$ID), "\n")
+cat("Number of split subtracks retained:", dplyr::n_distinct(hmm_split$ID), "\n")
+```
+
+# Thin / regularise the tracks to the selected interval
+
+```{r thin-tracks}
+# Round timestamps to the chosen regular interval.
+hmm_thinned <- hmm_split %>%
+  mutate(
+    time_round = round_date(time, paste(hmm_res_min, "min"))
+  ) %>%
+  arrange(ID, time, .by_group = FALSE) %>%
+  group_by(ID, time_round) %>%
+  slice(1) %>%                                                               # keep the first observation in each rounded time bin
+  ungroup() %>%
+  mutate(
+    time = time_round
+  ) %>%
+  select(-time_round) %>%
+  arrange(ID, time)
+
+# Print a quick check.
+cat("Number of rows after thinning:", nrow(hmm_thinned), "\n")
+cat("Number of subtracks after thinning:", dplyr::n_distinct(hmm_thinned$ID), "\n")
+```
+
+# Re-check missingness after splitting and thinning
+
+```{r post-thinning-check}
+post_thinning_check <- hmm_thinned %>%
+  group_by(ID) %>%
+  summarise(
+    n_points = n(),
+    prop_missing_at_selected_res = p_na(time, hmm_res_min),
+    .groups = "drop"
+  )
+
+post_thinning_summary <- post_thinning_check %>%
+  summarise(
+    n_tracks = n(),
+    mean_prop_missing = mean(prop_missing_at_selected_res, na.rm = TRUE),
+    median_prop_missing = median(prop_missing_at_selected_res, na.rm = TRUE),
+    max_prop_missing = max(prop_missing_at_selected_res, na.rm = TRUE)
+  )
+
+post_thinning_summary
+```
+
+# Prepare movement streams for the HMM
+
+```{r prepdata}
+# Convert to a plain data.frame for reliable compatibility with momentuHMM::prepData().
+hmm_thinned_df <- as.data.frame(hmm_thinned)
+
+# Calculate step length and turning angle from the regularised data.
+# With type = "LL", step lengths are calculated in kilometres
+# and turning angles are based on initial bearings.
+hmm_data <- momentuHMM::prepData(
+  data = hmm_thinned_df,
+  type = "LL",
+  coordNames = c("x", "y")
+) %>%
+  tibble::as_tibble() %>%
+  group_by(ID) %>%
+  arrange(time, .by_group = TRUE) %>%
+  mutate(
+    dt_h = as.numeric(difftime(time, lag(time), units = "hours")),          # realised time lag in hours
+    speed_kmh = step / dt_h                                                 # speed in km/h
+  ) %>%
+  ungroup()
+```
+
+# Clean the HMM input data
+
+```{r clean-hmm-input}
+# Keep only rows where step and angle are available.
+# The first observation of each track cannot have both metrics.
+hmm_data_fit <- hmm_data %>%
+  filter(!is.na(step), !is.na(angle)) %>%
+  filter(is.finite(step), is.finite(angle)) %>%
+  arrange(ID, time)
+
+cat("Rows used for HMM fitting:", nrow(hmm_data_fit), "\n")
+cat("Tracks used for HMM fitting:", dplyr::n_distinct(hmm_data_fit$ID), "\n")
+```
+
+# Inspect the fitted-data distributions
+
+```{r input-distributions}
+fig_step_hist <- ggplot(hmm_data_fit, aes(x = step)) +
+  geom_histogram(bins = 60) +
+  labs(
+    title = "Distribution of step length used in the HMM",
+    x = "Step length (km)",
+    y = "Count"
+  ) +
+  theme_paper()
+
+fig_angle_hist <- ggplot(hmm_data_fit, aes(x = angle * 180 / pi)) +
+  geom_histogram(bins = 60) +
+  labs(
+    title = "Distribution of turning angle used in the HMM",
+    x = "Turning angle (degrees)",
+    y = "Count"
+  ) +
+  theme_paper()
+
+fig_step_hist
+fig_angle_hist
+```
+
+# Define the HMM structure
+
+```{r hmm-setup}
+# Fit a 2-state HMM using:
+# - gamma distribution for step length
+# - von Mises distribution for turning angle
+dist <- list(
+  step = "gamma",
+  angle = "vm"
+)
+```
+
+# Choose starting values
+
+```{r start-values}
+# Use simple data-informed starting values.
+# One state starts with shorter steps; the other with longer steps.
+step_quants <- quantile(hmm_data_fit$step, probs = c(0.25, 0.75), na.rm = TRUE)
+
+mu0 <- c(
+  as.numeric(step_quants[1]),
+  as.numeric(step_quants[2])
+)
+
+sigma0 <- c(
+  max(mu0[1] / 2, 0.01),
+  max(mu0[2] / 2, 0.01)
+)
+
+# Lower kappa = broader turning-angle distribution.
+# Higher kappa = more concentrated turning around zero.
+kappa0 <- c(0.5, 2)
+
+Par0 <- list(
+  step = c(mu0, sigma0),
+  angle = kappa0
+)
+
+Par0
+```
+
+# Fit the 2-state HMM
+
+```{r fit-hmm}
+# Fit the hidden Markov model on the regularised movement data.
+hmm_fit <- momentuHMM::fitHMM(
+  data = hmm_data_fit,
+  nbStates = nbStates,
+  dist = dist,
+  Par0 = Par0
+)
+```
+
+# Inspect the fitted model
+
+```{r inspect-model}
+print(hmm_fit)
+
+# Extract a few simple model diagnostics.
+hmm_loglik <- as.numeric(logLik(hmm_fit))
+hmm_aic <- AIC(hmm_fit)
+
+model_info_tbl <- tibble::tibble(
+  nb_states = nbStates,
+  chosen_resolution_min = hmm_res_min,
+  max_gap_min = max_gap_min,
+  min_subtrack_duration_min = min_subtrack_duration_min,
+  logLik = hmm_loglik,
+  AIC = hmm_aic
+)
+
+model_info_tbl
+```
+
+# Decode the most likely state sequence
+
+```{r decode-states}
+# Use Viterbi decoding to assign the most likely state to each step.
+decoded_states <- momentuHMM::viterbi(hmm_fit)
+
+hmm_data_decoded <- hmm_data_fit %>%
+  mutate(decoded_state = decoded_states)
+```
+
+# Summarise the decoded states
+
+```{r state-summaries}
+# Summarise movement properties by decoded state.
+state_summary_tbl <- hmm_data_decoded %>%
+  group_by(decoded_state) %>%
+  summarise(
+    n_steps = n(),
+    mean_step_km = mean(step, na.rm = TRUE),
+    sd_step_km = sd(step, na.rm = TRUE),
+    mean_speed_kmh = mean(speed_kmh, na.rm = TRUE),
+    sd_speed_kmh = sd(speed_kmh, na.rm = TRUE),
+    mean_turn_deg = mean(angle * 180 / pi, na.rm = TRUE),
+    mean_abs_turn_deg = mean(abs(angle * 180 / pi), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(mean_step_km)
+
+# Assign a simple ecological label by ordering states from shorter to longer steps.
+state_summary_tbl <- state_summary_tbl %>%
+  mutate(
+    behavioural_label = c("Searching-like", "Transit-like")
+  )
+
+state_summary_tbl
+```
+
+# Summarise state budgets by year
+
+```{r state-budgets}
+state_budget_by_year <- hmm_data_decoded %>%
+  group_by(year_season, decoded_state) %>%
+  summarise(
+    n_steps = n(),
+    .groups = "drop_last"
+  ) %>%
+  mutate(
+    prop_steps = n_steps / sum(n_steps)
+  ) %>%
+  ungroup() %>%
+  left_join(
+    state_summary_tbl %>% select(decoded_state, behavioural_label),
+    by = "decoded_state"
+  )
+
+state_budget_by_year
+```
+
+# Figures: state-dependent distributions
+
+```{r state-distribution-figures}
+fig_step_by_state <- ggplot(hmm_data_decoded, aes(x = step, fill = factor(decoded_state))) +
+  geom_histogram(bins = 60, alpha = 0.7, position = "identity") +
+  labs(
+    title = "Step length distribution by decoded state",
+    x = "Step length (km)",
+    y = "Count",
+    fill = "State"
+  ) +
+  theme_paper()
+
+fig_angle_by_state <- ggplot(hmm_data_decoded, aes(x = angle * 180 / pi, fill = factor(decoded_state))) +
+  geom_histogram(bins = 60, alpha = 0.7, position = "identity") +
+  labs(
+    title = "Turning-angle distribution by decoded state",
+    x = "Turning angle (degrees)",
+    y = "Count",
+    fill = "State"
+  ) +
+  theme_paper()
+
+fig_step_by_state
+fig_angle_by_state
+```
+
+# Figure: state budget by year
+
+```{r state-budget-figure}
+fig_state_budget <- ggplot(
+  state_budget_by_year,
+  aes(x = year_season, y = prop_steps, fill = behavioural_label)
+) +
+  geom_col(position = "stack") +
+  labs(
+    title = "Decoded behavioural state budget by year",
+    subtitle = paste0(
+      "Regularised to ", hmm_res_min, "-minute intervals; split at gaps > ",
+      max_gap_min, " minutes"
+    ),
+    x = "Year",
+    y = "Proportion of steps",
+    fill = "Behavioural label"
+  ) +
+  theme_paper()
+
+fig_state_budget
+```
+
+# Figure: example regularised trip with decoded states
+
+```{r example-trip-figure}
+# Select one example track with many steps for visualisation.
+example_trip_id <- hmm_data_decoded %>%
+  count(ID, sort = TRUE) %>%
+  slice(1) %>%
+  pull(ID)
+
+# Build plotting data by joining decoded states back to the thinned coordinates.
+example_trip_plot_tbl <- hmm_data_decoded %>%
+  filter(ID == example_trip_id) %>%
+  left_join(
+    hmm_thinned %>%
+      select(ID, time, x, y),
+    by = c("ID", "time")
+  )
+
+fig_example_trip <- ggplot(example_trip_plot_tbl, aes(x = x, y = y, colour = factor(decoded_state))) +
+  geom_path(alpha = 0.6) +
+  geom_point(size = 1.2) +
+  labs(
+    title = paste("Example regularised subtrack coloured by decoded state:", example_trip_id),
+    x = "Longitude",
+    y = "Latitude",
+    colour = "State"
+  ) +
+  theme_paper()
+
+fig_example_trip
+```
+
+# Save figures
+
+```{r save-figures}
+ggsave(file.path(output_dir, "fig_resolution_summary.png"), fig_resolution, width = 7, height = 5, dpi = 300)
+ggsave(file.path(output_dir, "fig_resolution_boxplot.png"), fig_resolution_box, width = 7, height = 5, dpi = 300)
+ggsave(file.path(output_dir, "fig_step_histogram_hmm_input.png"), fig_step_hist, width = 7, height = 5, dpi = 300)
+ggsave(file.path(output_dir, "fig_turn_angle_histogram_hmm_input.png"), fig_angle_hist, width = 7, height = 5, dpi = 300)
+ggsave(file.path(output_dir, "fig_step_by_state.png"), fig_step_by_state, width = 7, height = 5, dpi = 300)
+ggsave(file.path(output_dir, "fig_turn_angle_by_state.png"), fig_angle_by_state, width = 7, height = 5, dpi = 300)
+ggsave(file.path(output_dir, "fig_state_budget_by_year.png"), fig_state_budget, width = 7, height = 5, dpi = 300)
+ggsave(file.path(output_dir, "fig_example_trip_by_state.png"), fig_example_trip, width = 7, height = 5, dpi = 300)
+```
+
+# Save tables
+
+```{r save-tables}
+readr::write_csv(resolution_eval, file.path(output_dir, "resolution_eval_by_track.csv"))
+readr::write_csv(resolution_summary, file.path(output_dir, "resolution_summary.csv"))
+readr::write_csv(post_thinning_check, file.path(output_dir, "post_thinning_check.csv"))
+readr::write_csv(model_info_tbl, file.path(output_dir, "hmm_model_info.csv"))
+readr::write_csv(hmm_data_decoded, file.path(output_dir, "hmm_data_decoded.csv"))
+readr::write_csv(state_summary_tbl, file.path(output_dir, "hmm_state_summary.csv"))
+readr::write_csv(state_budget_by_year, file.path(output_dir, "hmm_state_budget_by_year.csv"))
+```
+
+# Save model object
+
+```{r save-model}
+saveRDS(hmm_fit, file.path(output_dir, "hmm_fit_2state.rds"))
+```
+
+# Save workbook
+
+```{r workbook}
+wb <- openxlsx::createWorkbook()
+
+openxlsx::addWorksheet(wb, "resolution_summary")
+openxlsx::writeData(wb, "resolution_summary", resolution_summary)
+
+openxlsx::addWorksheet(wb, "post_thinning_check")
+openxlsx::writeData(wb, "post_thinning_check", post_thinning_check)
+
+openxlsx::addWorksheet(wb, "model_info")
+openxlsx::writeData(wb, "model_info", model_info_tbl)
+
+openxlsx::addWorksheet(wb, "state_summary")
+openxlsx::writeData(wb, "state_summary", state_summary_tbl)
+
+openxlsx::addWorksheet(wb, "state_budget_by_year")
+openxlsx::writeData(wb, "state_budget_by_year", state_budget_by_year)
+
+openxlsx::saveWorkbook(
+  wb,
+  file.path(output_dir, "03_hmm_behavioural_states_outputs.xlsx"),
+  overwrite = TRUE
+)
+```
+
+# Interpretation summary
+
+```{r interpretation-summary, results='asis'}
+search_state <- state_summary_tbl %>%
+  filter(behavioural_label == "Searching-like")
+
+transit_state <- state_summary_tbl %>%
+  filter(behavioural_label == "Transit-like")
+
+cat("## Interpretation of HMM outputs\n\n")
+
+cat(
+  "This HMM was fitted after splitting tracks at gaps greater than **",
+  max_gap_min,
+  " minutes** and regularising the data to **",
+  hmm_res_min,
+  "-minute intervals**.\n\n",
+  sep = ""
+)
+
+cat("A 2-state Hidden Markov Model was fitted to step length and turning angle derived from the regularised tracking data.\n\n")
+
+cat(
+  "The state with the shorter mean step length was interpreted as a **searching-like state**, ",
+  "while the state with the longer mean step length was interpreted as a **transit-like state**.\n\n",
+  sep = ""
+)
+
+cat(
+  "The searching-like state had a mean step length of **",
+  round(search_state$mean_step_km, 2),
+  " km** and a mean absolute turning angle of **",
+  round(search_state$mean_abs_turn_deg, 2),
+  " degrees**. ",
+  "The transit-like state had a mean step length of **",
+  round(transit_state$mean_step_km, 2),
+  " km** and a mean absolute turning angle of **",
+  round(transit_state$mean_abs_turn_deg, 2),
+  " degrees**.\n\n",
+  sep = ""
+)
+
+cat(
+  "These values are consistent with the ecological interpretation that searching behaviour is associated with shorter, more tortuous movement, ",
+  "whereas transit behaviour is associated with longer, more directed movement.\n\n",
+  sep = ""
+)
+
+cat(
+  "The decoded state budget by year can be used to compare how much time birds spent in searching-like versus transit-like behaviour in 2025 and 2026. ",
+  "These results provide a model-based complement to the descriptive threshold analysis carried out in script 02.\n"
+)
+```
+
+# End
+
+```{r end}
+cat("03_hmm_behavioural_states completed successfully.\n")
+cat("Outputs saved in:", output_dir, "\n")
+```

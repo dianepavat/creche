@@ -1,0 +1,904 @@
+---
+title: "01 - Filter 2025 Hummock tracking data"
+author: "Diane Pavat"
+date: "2026-03-31"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Script to assess and remove erroneous data points and bind all datasets from same deployment.  
+  
+Code was written by Diane Pavat with the help of AI (chatGPT).  
+  
+This code is set up for **pathtrack** data, for data collected on **Hummock in January 2025**.  
+  
+  
+# 1. Load your libraries 
+```{r}
+library(dplyr)
+library(readr)
+library(cowplot)
+library(openxlsx)
+library(ggplot2)
+library(patchwork)
+library(viridis)
+library(ggpp)           # to be able to do a table in ggplot
+library(leaflet)
+library(htmlwidgets)
+library(ggthemes)
+library(leaflet.extras)
+library(move2)          # for dealing with movement data
+library(sf)             # for spatial manipulation
+library(tidyverse)      # for data wrangling
+library(lubridate)      # dealing with time
+library(ggspatial)      # to annotate on maps
+library(rnaturalearth)  # background maps
+library(atlastools)     # movement data cleaning 
+library(here)           # avoids error-prone directories
+library(units)          # to handle/convert physical units
+library(ggpubr)         # multipanel ggplots
+library(amt)            # movement tools
+library(suncalc)        # calculate sunrise/sundown
+library(janitor)        # helps with data cleaning
+```
+  
+  
+# 2. Input your files  
+Set the input file working directory
+```{r}
+hummock25_dir <- "C:/Users/r01dp24/OneDrive - University of Aberdeen/Documents/PhD/05-Data/02 - Tracking data/01 - My data/2025-01-Hummock Island"
+
+```
+  
+Input the files into a database
+```{r}
+#hummock 2025 raw trackindata
+hummock25 <- list.files(hummock25_dir, pattern = "*.csv")
+
+# falkland island polygon
+fi <- st_read("C:/Users/r01dp24/OneDrive - University of Aberdeen/Documents/PhD/05-Data/01 - Shapefile/boundaries/falklands_boundaries.shp")
+fi <- st_transform(fi, 32721)
+
+# Beauchene polygon
+beauchene <- st_read("C:/Users/r01dp24/OneDrive - University of Aberdeen/Documents/PhD/05-Data/01 - Shapefile/beauchene.shp") 
+beauchene <- st_transform(beauchene, 32721)
+```
+  
+Remove beauchene for easier map display
+```{r}
+#difference on geometries only
+fi_geom_diff <- st_difference(
+  st_geometry(fi),
+  st_union(st_geometry(beauchene)))
+
+#union back into ONE geometry (so attributes stay 1-row)
+fi_geom_diff <- st_union(fi_geom_diff)
+
+#rebuild sf with original attributes
+fi_no_beauchene_utm <- fi
+st_geometry(fi_no_beauchene_utm) <- fi_geom_diff
+fi_no_beauchene_utm <- fi_no_beauchene_utm[!st_is_empty(fi_no_beauchene_utm), ]
+
+#have lon/lat for plotting with leaflet/ggplot
+fi_no_beauchene <- st_transform(fi_no_beauchene_utm, 4326)
+fi <- fi_no_beauchene
+```
+  
+Get the files from the Hummock 2025 folder
+```{r}
+firstime <- TRUE
+for (f in 1:length(hummock25)) {
+  hummock25_f <- read_csv(paste(hummock25_dir, hummock25[f], sep = "/"))
+  
+  if (firstime)
+  {
+    fulldfhummock25 <- hummock25_f
+    firstime <- FALSE
+  }
+  
+  else{
+    fulldfhummock25 <- rbind.data.frame(fulldfhummock25, hummock25_f)
+  }
+}
+```
+  
+Organise the combined tracking dataset
+```{r}
+# Clean column names
+colnames(fulldfhummock25) <- trimws(colnames(fulldfhummock25))
+
+# Convert columns to proper types
+fulldfhummock25 <- fulldfhummock25 %>%
+  mutate(
+    # Convert to numeric
+    day = as.numeric(day),
+    month = as.numeric(month),
+    year = as.numeric(year),
+    hour = as.numeric(hour),
+    minute = as.numeric(minute),
+    second = as.numeric(second),
+    satellite = as.numeric(satellite),
+    lat = as.numeric(lat),
+    long = as.numeric(long),
+    battery = as.numeric(battery),
+    height = as.numeric(height),
+    tagnumber = as.character(tagnumber)
+  )
+
+cat("  Tag number:", unique(fulldfhummock25$tagnumber), "\n")
+cat("  Number of rows:", nrow(fulldfhummock25), "\n")
+```
+  
+Create datetime column  
+Here we apply a 3hr correction. This is because while the GPS data were recorded (Start/end time) a UTC-3 (FI timezone), the raw datafiles show the time in UTC. We therefore remove 3hr here to make sure the time is displayed in the local timezone. 
+```{r}
+fulldfhummock25 <- fulldfhummock25 %>%
+  mutate(
+    # Fix year (assuming 2000s)
+    year_full = ifelse(year < 100, year + 2000, year),
+    # Create datetime
+    datetime = make_datetime(year_full, month, day, hour, minute, second, tz = "UTC") - hours(3)
+  ) %>%
+  
+  mutate(
+    year = year(datetime),
+    month = month(datetime),
+    day = day(datetime),
+    hour = hour(datetime),
+    minute = minute(datetime),
+    second = second(datetime),
+    date = as.Date(datetime),
+    time = format(datetime, "%H:%M:%S"),
+    year_full = as.factor(year_full)
+  )
+```
+
+Check the dataset structure
+```{r}
+str(fulldfhummock25)
+
+#Add a deployment ID column
+fulldfhummock25$colony_name <- "Hummock Island"
+fulldfhummock25$colony_code <- "HI"
+fulldfhummock25$deploymentid <- "2025-01-Hummock"
+
+str(fulldfhummock25)
+```
+  
+# 3. Pre-filter for empty GPS points and unreasonable speeds  
+Filter out invalid data points (where lat/long are 0 or NA)
+```{r}
+hummock25_filtered <- fulldfhummock25 %>%
+  mutate(row_id = row_number())
+
+hummock25_filtered <- hummock25_filtered %>%
+  filter(lat != 0, long != 0, !is.na(lat), !is.na(long))
+
+cat("  Valid data points (non-zero lat/long):", nrow(hummock25_filtered), "\n")
+
+if (nrow(hummock25_filtered) == 0) {
+  cat("  No valid data points found\n")
+  return(NULL)
+}
+```
+  
+Filter out unreasonable speed/ step-length quality check filter
+```{r}
+# Start conservative, then tighten after you look at summaries.
+max_speed_m_s <- 12        # e.g., 10 m/s = 36.0 km/h (very conservative)
+max_step_m    <- 20000    # e.g., 20 km between successive fixes (also conservative)
+
+pick_col <- function(df, candidates) {
+  nm <- names(df)
+  hit <- candidates[candidates %in% nm]
+  if (length(hit) == 0) NA_character_ else hit[1]
+}
+
+auto_rows_to_remove <- integer(0)
+step_metrics_all <- list()
+
+for (b in unique(hummock25_filtered$tagnumber)) {
+  
+  dfb <- hummock25_filtered %>%
+    filter(tagnumber == b) %>%
+    filter(is.finite(long), is.finite(lat), !is.na(datetime)) %>%
+    arrange(datetime)
+  
+  if (nrow(dfb) < 3) next
+  
+  # Build amt track, then project to metres (UTM 21S)
+  trk_ll  <- make_track(dfb, .x = long, .y = lat, .t = datetime, crs = 4326)
+  trk_utm <- transform_coords(trk_ll, 32721)
+  
+  st <- steps(trk_utm, keep_cols = "start")
+  
+  sl_col <- pick_col(st, c("sl_", "step_length", "sl"))
+  dt_col <- pick_col(st, c("dt_", "dt"))
+  t2_col <- pick_col(st, c("t2_", "t2"))  # end time of step (preferred)
+  
+  if (is.na(sl_col) || is.na(dt_col)) {
+    warning("Could not find step-length/dt columns in steps() for tag ", b,
+            ". Found: ", paste(names(st), collapse = ", "))
+    next
+  }
+  
+  dt_s <- as.numeric(st[[dt_col]], units = "secs")
+  step_m <- as.numeric(st[[sl_col]])
+  speed_m_s <- step_m / dt_s
+  
+  # flag bad steps (per step, i.e. between fixes)
+  bad_step <- is.na(dt_s) | dt_s <= 0 |
+    is.na(step_m) | step_m > max_step_m |
+    is.na(speed_m_s) | speed_m_s > max_speed_m_s
+  
+  # collect step metrics, attached to END point time (t2_)
+  if (!is.na(t2_col)) {
+    step_metrics_all[[as.character(b)]] <- tibble(
+      tagnumber = b,
+      datetime  = st[[t2_col]],
+      step_m    = step_m,
+      speed_m_s = speed_m_s
+    )
+    
+    # remove END points of bad steps
+    bad_end_times <- st[[t2_col]][bad_step]
+    auto_rows_to_remove <- c(
+      auto_rows_to_remove,
+      dfb$row_id[dfb$datetime %in% bad_end_times]
+    )
+    
+  } else {
+    # fallback alignment by index: step i corresponds to point i+1
+    step_metrics_all[[as.character(b)]] <- tibble(
+      tagnumber = b,
+      datetime  = dfb$datetime[-1],
+      step_m    = step_m,
+      speed_m_s = speed_m_s
+    )
+    
+    idx_bad <- which(bad_step)
+    drop_idx <- idx_bad + 1
+    drop_idx <- drop_idx[drop_idx <= nrow(dfb)]
+    auto_rows_to_remove <- c(auto_rows_to_remove, dfb$row_id[drop_idx])
+  }
+}
+
+auto_rows_to_remove <- sort(unique(auto_rows_to_remove))
+cat(length(auto_rows_to_remove), "auto QC flagged rows", "\n")
+```
+  
+Join step metrics onto the full filtered dataset (first point per tag will have NA step/speed)
+```{r}
+step_metrics_df <- bind_rows(step_metrics_all)
+
+hummock25_with_steps <- hummock25_filtered %>%
+  left_join(step_metrics_df, by = c("tagnumber", "datetime"))
+```
+  
+"Fake cleaned" dataset (for stats only; actual removal happens later)
+```{r}
+hummock25_filtered2 <- hummock25_with_steps %>%
+  filter(!row_id %in% auto_rows_to_remove)
+
+cat("\n--- SPEED/STEP QC SUMMARY (AMT) ---\n")
+cat("Points after coord filter:", nrow(hummock25_filtered), "\n")
+cat("Points flagged by QC:", length(auto_rows_to_remove), "\n")
+cat("Points after QC (if removed):", nrow(hummock25_filtered2), "\n")
+cat("Max step (m) before QC:", suppressWarnings(max(hummock25_with_steps$step_m, na.rm = TRUE)), "\n")
+cat("Max step (m) after QC:", suppressWarnings(max(hummock25_filtered2$step_m, na.rm = TRUE)), "\n")
+cat("Max speed (m/s) before QC:", suppressWarnings(max(hummock25_with_steps$speed_m_s, na.rm = TRUE)), "\n")
+cat("Max speed (m/s) after QC:", suppressWarnings(max(hummock25_filtered2$speed_m_s, na.rm = TRUE)), "\n")
+```
+  
+# 4. Set up files for interactive map  
+If you have datetime/date/time columns, keep them for popups
+```{r}
+has_datetime <- "datetime" %in% names(hummock25_with_steps)
+has_date <- "date" %in% names(hummock25_with_steps)
+has_time <- "time" %in% names(hummock25_with_steps)
+
+#colour palette by day
+days <- sort(unique(hummock25_with_steps$date))
+pal_day <- colorFactor(palette = viridis(length(days)), domain = days)
+
+#hover text (label) and click text (popup)
+make_html <- function(df) {
+  tm <- if (has_time)     paste0("<b>Time:</b> ", df$time, "<br>")         else ""
+  
+  paste0(
+    "<b>ID:</b> ", df$row_id, "<br>",
+    "<b>Tag:</b> ", df$tagnumber, "<br>",
+    "<b>Date:</b> ", df$date, "<br>",
+    tm,
+    "<b>Lat:</b> ", round(df$lat, 5), "<br>",
+    "<b>Lon:</b> ", round(df$long, 5), "<br>",
+    "<b>Speed (m/s):</b> ", round(df$speed_m_s, 3), "<br>",
+    "<b>Step (m):</b> ", round(df$step_m, 3)
+  )
+}
+
+
+hummock25_with_steps$popup_html <- make_html(hummock25_with_steps)
+
+#labels show on hover: keep them short so they don't cover the map
+hummock25_with_steps$label_txt <- paste0(
+  "ID: ", hummock25_with_steps$row_id,
+  " | Tag: ", hummock25_with_steps$tagnumber,
+  " | Date: ", hummock25_with_steps$date,
+  " | Time: ", hummock25_with_steps$time,
+  " | Lat: ", round(hummock25_with_steps$lat, 4),
+  " | Lon: ", round(hummock25_with_steps$long, 4),
+  " | Step (m): ", round(hummock25_with_steps$step_m,3),
+  " | Speed (m/s): ", round(hummock25_with_steps$speed_m_s, 3)
+)
+
+birds <- sort(unique(hummock25_with_steps$tagnumber))
+
+#colony coordinates
+colony <- list(lat = -51.614323, lon = -60.452388)
+
+#add buffer around the colony for visualisation and future deletion
+buffer_m <- 100
+
+colony_sf <- st_as_sf(
+  data.frame(lon = colony$lon, lat = colony$lat),
+  coords = c("lon", "lat"),
+  crs = 4326
+)
+
+#use UTM 21S to convert distances in metres
+colony_buf_sf <- colony_sf %>%
+  st_transform(32721) %>%      # metres
+  st_buffer(dist = buffer_m) %>%
+  st_transform(4326)           # back to lon/lat for leaflet + ggplot
+```
+  
+# 5. Interactive maps  
+## 5.1. Map 1 - Check raw data to find points to remove  
+```{r}
+#Mark points from the auto removal list (do not remove yet)
+hummock25_filter_temp <- hummock25_with_steps %>%
+  mutate(to_remove = row_id %in% auto_rows_to_remove)
+
+filtered <- leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addScaleBar(position = "bottomleft")
+
+#add per-bird layers
+for (b in birds) {
+  dfb <- hummock25_filter_temp %>% filter(tagnumber == b) %>% arrange(datetime)
+  
+  filtered <- filtered %>%
+    addPolylines(data = dfb, lng = ~ long, lat = ~ lat, group = b,
+                 color = "#666666", weight = 3, opacity = 0.8) %>%
+    
+    addCircleMarkers(data = dfb, lng = ~ long, lat = ~ lat, group = b,
+                     radius = 3, # pixels (marker size only)
+                     color = ~ pal_day(date), stroke = FALSE,
+                     fillOpacity = 0.8, label = ~ label_txt,
+                     labelOptions = labelOptions(noHide = FALSE, 
+                                                 direction = "auto",
+                                                 textsize = "12px",
+                                                 opacity = 0.95),
+                     popup = ~ popup_html) %>%
+    
+    # Points flagged for removal
+    addCircleMarkers(
+      data = dfb %>% filter(to_remove),
+      lng = ~ long, lat = ~ lat, group = b,
+      radius = 6, color = "red", stroke = TRUE, weight = 2,
+      fillColor = "red", fillOpacity = 0.95,
+      label = ~ paste0("REMOVE → ", label_txt),
+      labelOptions = labelOptions(noHide = FALSE,
+                                  direction = "auto",
+                                  textsize = "12px",
+                                  opacity = 0.95),
+      popup = ~ popup_html)
+}
+
+# Add colony buffer (true 100 m)
+filtered <- filtered %>%
+  addPolygons(data = colony_buf_sf, color = "orange", weight = 2,
+              fillColor = "orange", fillOpacity = 0.08,
+              group = "Colony buffer", label = paste0("Colony buffer: ",
+                                                      buffer_m, " m"))
+
+# Add colony point
+filtered <- filtered %>%
+  addCircleMarkers(lng = colony$lon, lat = colony$lat, radius = 7, 
+                   color = "orange", fillColor = "orange",
+                   fillOpacity = 0.9, stroke = FALSE, label = "Colony",
+                   popup = paste0("<b>Colony</b><br>Lat: ", colony$lat,
+                                  "<br>Lon: ", colony$lon),
+                   group = "Colony") %>%
+  
+  addLayersControl(
+    #overlayGroups = c(birds, "Colony", "Colony buffer"),
+    overlayGroups = c(birds),
+    options = layersControlOptions(collapsed = FALSE)
+  ) %>%
+  
+  addLegend(
+    position = "bottomleft", pal = pal_day,
+    values = hummock25_filter_temp$date, title = "Date", opacity = 1
+  )
+
+# Start by showing only the first bird (so toggles are visible)
+filtered <- filtered %>%
+  hideGroup(birds) %>%
+  showGroup(birds[1]) #%>%
+  # showGroup("Colony") %>%
+  # showGroup("Colony buffer")
+
+filtered
+```
+  
+## 5.2. Map 2 - Remove erroenous points and check new map
+In this new interactive map you will be able to highlight all the points to be removed in red. This the moment you want to check that nothing was missed or added by msitake.  
+
+1. list the points to remove or to keep from the automatic list
+```{r}
+manual_rows_to_remove <- c(2086, #tag 45755
+                           412, 659, #tag 45774
+                           1509, 2505, 1214, 1372, 2670, 1519, 1418, 2669, 2648, #tag 45781
+                           3109, 1800, #tag 45801
+                           2411, 3199, 2694, 2414, 2423, 2413, 3179, 2695, 2424 #tag 45802
+)
+
+auto_rows_to_keep <- c(2506, 2630 #tag 45781
+                       )
+
+# Remove "kept" points from the auto-flagged list
+auto_rows_to_remove_final <- setdiff(auto_rows_to_remove, auto_rows_to_keep)
+
+rows_to_remove <- sort(unique(c(
+  auto_rows_to_remove_final,
+  manual_rows_to_remove
+)))
+
+cat(length(auto_rows_to_remove), "auto flagged rows", "-", length(auto_rows_to_keep), "flagged rows to keep", "\n")
+cat(length(auto_rows_to_remove_final), "auto rows to remove",  "\n")
+cat(length(manual_rows_to_remove), "manual rows to remove", "\n")
+cat(length(rows_to_remove), "rows to be removed", "\n")
+
+
+# Mark points for removal (do not remove yet)
+hummock25_review <- hummock25_with_steps %>%
+  mutate(to_remove = row_id %in% rows_to_remove)
+```
+  
+2. map all the points with removals in red.
+```{r}
+review_map <- leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addScaleBar(position = "bottomleft")
+
+for (b in birds) {
+  dfb <- hummock25_review %>% filter(tagnumber == b) %>% arrange(datetime)
+  
+  review_map <- review_map %>%
+    addPolylines(data = dfb, lng = ~ long, lat = ~ lat, group = b,
+                 color = "#666666", weight = 3, opacity = 0.8) %>%
+    # Normal points
+    addCircleMarkers(data = dfb %>% 
+                       filter(!to_remove), lng = ~ long, lat = ~ lat,
+                     group = b, radius = 3, color = ~ pal_day(date), 
+                     stroke = FALSE, fillOpacity = 0.7, label = ~ label_txt,
+                     labelOptions = labelOptions(noHide = FALSE,
+                                                 direction = "auto",
+                                                 textsize = "12px",
+                                                 opacity = 0.95),
+                     popup = ~ popup_html) %>%
+    
+    # Points flagged for removal
+    addCircleMarkers(
+      data = dfb %>% 
+        filter(to_remove), lng = ~ long, lat = ~ lat, group = b,
+      radius = 6, color = "red", stroke = TRUE, weight = 2,
+      fillColor = "red", fillOpacity = 0.95,
+      label = ~ paste0("REMOVE → ", label_txt),
+      labelOptions = labelOptions(noHide = FALSE, direction = "auto",
+                                  textsize = "12px", opacity = 0.95),
+      popup = ~ popup_html)
+}
+
+# Add colony buffer + colony point
+review_map <- review_map %>%
+  addPolygons(
+    data = colony_buf_sf, color = "orange", weight = 2, 
+    fillColor = "orange", fillOpacity = 0.08, group = "Colony buffer",
+    label = paste0("Colony buffer: ", buffer_m, " m")
+  ) %>% 
+  addCircleMarkers(lng = colony$lon, lat = colony$lat, radius = 7,
+                   color = "orange", fillColor = "orange", 
+                   fillOpacity = 0.9, stroke = FALSE, label = "Colony",
+                   popup = paste0("<b>Colony</b><br>Lat: ", colony$lat,
+                                  "<br>Lon: ", colony$lon),
+                   group = "Colony"
+  ) %>%
+  addLayersControl(
+    overlayGroups = c(birds, "Colony", "Colony buffer"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) %>%
+  addLegend(
+    position = "bottomleft",
+    pal = pal_day,
+    values = hummock25_review$date,
+    title = "Date",
+    opacity = 1
+  ) %>%
+  hideGroup(birds) %>%
+  showGroup(birds[1]) %>%
+  showGroup("Colony") %>%
+  showGroup("Colony buffer")
+
+review_map
+```
+  
+## 5.3. Map 3 - Final check cleaned data
+```{r}
+hummock25_clean <- hummock25_review %>%
+  filter(!row_id %in% rows_to_remove)
+
+birds_clean <- sort(unique(as.character(hummock25_clean$tagnumber)))
+
+cleaned <- leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addScaleBar(position = "bottomright")
+
+for (b in birds_clean) {
+  dfb <- hummock25_clean %>% filter(tagnumber == b) %>% arrange(datetime)
+  
+  cleaned <- cleaned %>%
+    addPolylines(data = dfb, lng = ~ long, lat = ~ lat, group = b,
+                 color = "#666666", weight = 3, opacity = 0.8) %>%
+    
+    addCircleMarkers(data = dfb, lng = ~ long, lat = ~ lat, group = b,
+                     radius = 3, color = ~ pal_day(date), stroke = FALSE,
+                     fillOpacity = 0.8, 
+                     label = ~ label_txt, 
+                     labelOptions = labelOptions(noHide = FALSE,
+                                                 direction = "auto",
+                                                 textsize = "12px",
+                                                 opacity = 0.95),
+                     popup = ~ popup_html)
+}
+
+cleaned <- cleaned %>%
+  addPolygons(data = colony_buf_sf, color = "orange", weight = 2,
+              fillColor = "orange", fillOpacity = 0.08, 
+              group = "Colony buffer", label = paste0("Colony buffer: ",
+                                                      buffer_m, " m")
+  ) %>%
+  addCircleMarkers(lng = colony$lon, lat = colony$lat, radius = 7,
+                   color = "orange", fillColor = "orange",
+                   fillOpacity = 0.9, stroke = FALSE, label = "Colony",
+                   popup = paste0("<b>Colony</b><br>Lat: ", colony$lat,
+                                  "<br>Lon: ", colony$lon), 
+                   group = "Colony"
+  ) %>%
+  addLayersControl(
+    overlayGroups = c(birds_clean, "Colony", "Colony buffer"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) %>%
+  addLegend(
+    position = "bottomleft",
+    pal = pal_day,
+    values = hummock25_clean$date,
+    title = "Date",
+    opacity = 1
+  ) %>%
+  hideGroup(birds_clean) %>%
+  showGroup(birds_clean[1]) %>%
+  showGroup("Colony") %>%
+  showGroup("Colony buffer")
+
+cleaned
+```
+  
+Save the files and plots
+```{r}
+filename <- paste("C:/Users/r01dp24/OneDrive - University of Aberdeen/Documents/PhD/05-Data/02 - Tracking data/03 - Processed data/2025_01_Hummock.csv",
+  sep = "")
+write.csv(hummock25_clean, filename, row.names = F)
+```  
+
+# 6. Checking time-lag between fixes
+Use move2 functions so need to transform our data into a move2 object
+```{r}
+# hummock25_clean_2 <- mt_as_move2(hummock25_clean,
+#                                  coords = c("long","lat"),
+#                                  crs = "EPSG:4326",
+#                                  time_column = "datetime",
+#                                  track_id_column = "tagnumber",
+#                                  track_attributes = c("tagnumber"),  # optional
+#                                  na.fail = F) # if set to FALSE empty points are allowed 
+# 
+# time_lag <- mt_time_lags(hummock25_clean_2, units = "min")  # minutes
+# summary(time_lag)
+# 
+# # if you want to add that to your df
+# # keep in mind that you have to shift it 1 row below
+# hummock25_clean_2 <- bind_cols(hummock25_clean_2, as_tibble(c(NA, time_lag[-length(time_lag)])))
+# glimpse(hummock25_clean_2)
+# 
+# # visualise but cutting above 30min
+# # for graphical ease
+# ggplot(tibble(track = mt_track_id(hummock25_clean_2),
+#               time_lag = as.numeric(time_lag))) +
+#   geom_histogram(aes(time_lag),
+#                  bins = 200) +
+#   labs(x = "Time lag (min)", y = "Count", title = "Distribution of time lags") +
+#   #xlim(0, 30) +
+#   theme_minimal()
+# 
+# summary(time_lag)
+```
+  
+# 7. Plots to share
+## 7.1. Preparation for all mapping
+```{r}
+# Ensure tagnumber is character and date has global factor levels (so colours match across facets)
+all_dates <- sort(unique(hummock25_clean$date))
+
+plot_df_hummock25 <- hummock25_clean %>%
+  mutate(tagnumber = as.character(tagnumber),
+         date_f = factor(date, levels = all_dates)) %>%
+  arrange(tagnumber, datetime)
+
+
+# Colony point df
+colony_df_hummock25 <- data.frame(lon = colony$lon, lat = colony$lat)
+
+
+#set the min and max extent for the dataset to include in the facet wrap
+lon_min <- min(plot_df_hummock25$long, na.rm = TRUE) - 0.002
+lon_max <- max(plot_df_hummock25$long, na.rm = TRUE) + 0.002
+lat_min <- min(plot_df_hummock25$lat, na.rm = TRUE) - 0.002
+lat_max <- max(plot_df_hummock25$lat, na.rm = TRUE) + 0.002
+```
+  
+## 7.2. Maps for black backgrounds (powerpoint)
+### 7.2.1. Facet map | 1 panel per bird (same extent) | colour per day | with grid
+```{r}
+facet_tracks <- ggplot() +
+  # Falklands polygon (same in every facet; will be clipped by free scales)
+  geom_sf(data = fi, fill = "white", colour = "grey70", linewidth = 0.3) +
+  
+  # Coordinates extent
+  coord_sf(xlim = c(lon_min, lon_max),
+           ylim = c(lat_min, lat_max),
+           expand = FALSE) +
+  
+  # Track line
+  geom_path(data = plot_df_hummock25,
+            aes(x = long, y = lat, group = interaction(tagnumber, date_f),
+                colour = date_f),
+            linewidth = 0.8, alpha = 1) +
+  
+  # Colony marker
+  geom_point(data = data.frame(lon = colony$lon, lat = colony$lat),
+             aes(x = lon, y = lat),
+             colour = "red", size = 1) +
+
+  facet_wrap( ~ tagnumber, nrow = 2) +
+  
+  scale_color_hue(l = 75, c = 100) + #makes the colours brighter for black powerpoint slides
+  
+  geom_label(data = plot_df_hummock25 %>%
+              distinct(tagnumber),
+            aes(x = Inf, y = Inf, label = tagnumber),
+            hjust = 1, vjust = 1.5,
+            fill = "white", colour = "black", label.size=0, size = 5) +
+  
+  theme_void() +
+  theme(
+    panel.grid.major = element_line(colour = "grey85", linewidth = 0.2),
+    strip.text = element_blank(),
+    legend.position = "bottom",
+    legend.text = element_text(colour="white", size=20),
+    legend.title = element_blank(),
+    axis.title = element_blank()
+  )
+
+facet_tracks
+```
+  
+```{r}
+ggsave(filename = file.path("C:/Users/r01dp24/OneDrive - University of Aberdeen/Documents/PhD/05-Data/02 - Tracking data/03 - Processed data/2025_Hummock_facet_tracks.png"),
+       plot = facet_tracks,
+       width = 30,#size for powerpoint
+       height = 19,#size for powerpoint
+       dpi = 300,
+       unit = "cm"
+)
+```
+
+  
+### 7.2.2. One map | all birds | colour per bird | no grid
+```{r}
+all_tracks_PPX <- ggplot() +
+  geom_sf(data = fi, fill = "white", colour = "grey40", linewidth = 0.3) +
+  
+  geom_path(data  = plot_df_hummock25,
+            aes(x = long, y = lat, group = tagnumber, colour = tagnumber),
+            alpha = 1, linewidth = 0.8 ) +
+  
+  scale_color_hue(l = 75, c = 100) + #makes the colours brighter for black powerpoint slides
+  
+  coord_sf(
+    xlim = c(lon_min, lon_max),
+    ylim = c(lat_min, lat_max),
+    expand = FALSE
+  ) +
+  
+  theme_void() +
+  theme(
+    legend.position = "none",
+    axis.title = element_blank(),
+    text = element_text(colour = "white", size = 15)
+  )
+
+print(all_tracks_PPX)
+```
+  
+```{r}
+ggsave(filename = file.path("C:/Users/r01dp24/OneDrive - University of Aberdeen/Documents/PhD/05-Data/02 - Tracking data/03 - Processed data/2025_Hummock_all_tracks_PPX.png"),
+  plot = all_tracks_PPX,
+  width = 23.64,
+  height = 18.90,
+  dpi = 300,
+  unit = "cm"
+)
+```
+  
+## 7.3. Maps for white backgrounds (report)
+### 7.3.1. One map | all birds | colour per individual | with inset map
+```{r}
+################################################################################
+# import world dataset to map the south american continuent
+world <- ne_countries(scale = "medium", returnclass = "sf")
+world_32721 <- st_transform(world, 32721)
+
+south_america <- world %>%
+  filter(continent == "South America") %>%
+  st_transform(32721)
+
+
+# Build a bounding box from the tracks for the inset map (red location square)
+stopifnot(all(c("long", "lat") %in% names(plot_df_hummock25)))
+
+plot_df_hummock25_xy <- plot_df_hummock25 %>%
+  filter(!is.na(long), !is.na(lat))
+
+if (nrow(plot_df_hummock25_xy) == 0) {
+  stop("plot_df_hummock25 has no non-NA long/lat values, cannot build bounding box.")
+}
+
+xmin <- min(plot_df_hummock25_xy$long)
+xmax <- max(plot_df_hummock25_xy$long)
+ymin <- min(plot_df_hummock25_xy$lat)
+ymax <- max(plot_df_hummock25_xy$lat)
+
+# small padding in degrees (safe here)
+pad_x <- 0.05
+pad_y <- 0.05
+
+track_bbox <- st_bbox(c(xmin = xmin,xmax = xmax,
+                        ymin = ymin, ymax = ymax),
+                      crs = st_crs(4326))
+
+track_bbox_pad <- st_bbox(c(xmin = xmin - pad_x, xmax = xmax + pad_x,
+                            ymin = ymin - pad_y, ymax = ymax + pad_y),
+                          crs = st_crs(4326))
+
+bb_poly <- st_as_sfc(track_bbox) %>% st_as_sf()
+bb_poly_pad <- st_as_sfc(track_bbox_pad) %>% st_as_sf()
+
+
+################################################################################
+#Inset map: south america + FI
+inset_map <- ggplot() +
+  geom_sf(data = fi, fill = "grey85", colour = "grey40", linewidth = 0.3) +
+  geom_sf(data = bb_poly_pad, fill = NA, colour = "red", linewidth = 0.9) +
+  
+  coord_sf(expand = TRUE) +
+  
+  theme_void() +
+  theme(
+    panel.background = element_rect(fill = "white", colour = "black", linewidth = 0.4),
+    plot.background  = element_rect(fill = "white", colour = NA),
+    plot.margin = margin(2, 2, 2, 2)
+  )
+
+#Main map: with tracks
+all_tracks_report_inset <- ggplot() +
+  geom_sf(data = fi, fill = "grey85", colour = "grey40", linewidth = 0.3) +
+  
+  geom_path(data  = plot_df_hummock25,
+            aes(x = long, y = lat, group = tagnumber, colour = tagnumber),
+            alpha = 1, linewidth = 0.8) +
+  
+  coord_sf(xlim = c(lon_min, lon_max), 
+           ylim = c(lat_min, lat_max),
+           expand = TRUE) +
+  
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text = element_text(colour = "grey"),
+    axis.title = element_blank(),
+    axis.text.x = element_text(margin = margin(t = 4)),
+    text = element_text(colour = "black", size = 15),
+    panel.grid.major = element_line(colour="grey80"),
+    panel.grid.minor = element_line(colour="grey50"),
+    plot.margin = margin(10, 18, 10, 10) #Margin space so the inset can sit without hiding data (top, right, bottom, left)
+  )
+
+#Combine: place inset in the margin area (not over the tracks)
+all_tracks_report_inset <- ggdraw() +
+  draw_plot(all_tracks_report_inset) +
+  draw_plot(inset_map, x = 0.50, y = 0.10, 
+    width = 0.26, height = 0.26)
+
+print(all_tracks_report_inset)
+```
+  
+```{r}
+ggsave(filename = file.path("C:/Users/r01dp24/OneDrive - University of Aberdeen/Documents/PhD/05-Data/02 - Tracking data/03 - Processed data/2025_Hummock_all_tracks_report_inset.png"),
+       plot = all_tracks_report_inset,
+       width = 23.64,
+       height = 18.90,
+       dpi = 300,
+       unit = "cm"
+)
+```
+
+  
+### 7.3.2. One map | all birds | colour per bird |  without inset map
+```{r}
+all_tracks_report <- ggplot() +
+  geom_sf(data = fi, fill = "lightgrey", colour = "grey40", linewidth = 0.3) +
+  
+  geom_path(data  = plot_df_hummock25,
+            aes(x = long, y = lat, group = tagnumber, colour = tagnumber),
+            alpha = 1, linewidth = 0.8) +
+  
+  scale_color_hue(l = 75, c = 100) + #makes the colours brighter for black powerpoint slides
+  
+  coord_sf(
+    xlim = c(lon_min, lon_max),
+    ylim = c(lat_min, lat_max),
+    expand = FALSE
+  ) +
+  
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.title = element_blank(),
+    axis.text = element_text(colour = "grey70", size = 14),
+    axis.ticks = element_line(colour = "grey70"),
+    panel.grid.major = element_line(colour = "grey70", linewidth = 0.3),
+    panel.grid.minor = element_line(colour = "grey70", linewidth = 0.2)
+  ) +
+  
+  
+  annotate("label", x = lon_max - 0.005, y = lat_min + 0.04,
+           label = "2025-01-Hummock", hjust = 1, vjust = 1, fill = "white",
+           linewidth = 0, size = 7, colour="black")
+
+print(all_tracks_report)
+```  
+  
+```{r}
+ggsave(filename = file.path("C:/Users/r01dp24/OneDrive - University of Aberdeen/Documents/PhD/05-Data/02 - Tracking data/03 - Processed data/2025_Hummock_short_tracks_report.png"),
+       plot = all_tracks_report,
+       width = 23.64,
+       height = 18.90,
+       dpi = 300,
+       unit = "cm"
+)
+```

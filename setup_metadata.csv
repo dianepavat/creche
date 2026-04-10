@@ -1,0 +1,4 @@
+object_name,file_name,n_rows,created_on
+tracks,tracks_clean.rds,13286,2026-03-28 09:21:20.513606
+trips,trips_clean.rds,72,2026-03-28 09:21:20.513606
+qa,qa_clean.rds,86,2026-03-28 09:21:20.513606

@@ -1,0 +1,248 @@
+---
+title: "Mapping a comparison of 2025 and 2026 data - Hummock"
+author: "Diane Pavat"
+date: "2026-03-31"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Packages and libraries
+```{r}
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+```
+  
+# 2. Read CSV files
+```{r}
+h25 <- read_csv("C:/Users/r01dp24/OneDrive - University of Aberdeen/Documents/PhD/05-Data/02 - Tracking data/03 - Processed data/2025_01_Hummock.csv")
+
+h26 <- read_csv("C:/Users/r01dp24/OneDrive - University of Aberdeen/Documents/PhD/05-Data/02 - Tracking data/03 - Processed data/2026_01_Hummock.csv")
+```
+# 3. combine data
+```{r}
+tracks <- bind_rows(h25, h26)
+```
+
+# 5. Get land shp
+```{r}
+# falkland island polygon
+fi <- st_read("C:/Users/r01dp24/OneDrive - University of Aberdeen/Documents/PhD/05-Data/01 - Shapefile/boundaries/falklands_boundaries.shp")
+fi <- st_transform(fi, 32721)
+
+# Beauchene polygon
+beauchene <- st_read("C:/Users/r01dp24/OneDrive - University of Aberdeen/Documents/PhD/05-Data/01 - Shapefile/beauchene.shp") 
+beauchene <- st_transform(beauchene, 32721)
+
+#difference on geometries only
+fi_geom_diff <- st_difference(
+  st_geometry(fi),
+  st_union(st_geometry(beauchene)))
+
+#union back into ONE geometry (so attributes stay 1-row)
+fi_geom_diff <- st_union(fi_geom_diff)
+
+#rebuild sf with original attributes
+fi_no_beauchene_utm <- fi
+st_geometry(fi_no_beauchene_utm) <- fi_geom_diff
+fi_no_beauchene_utm <- fi_no_beauchene_utm[!st_is_empty(fi_no_beauchene_utm), ]
+
+#have lon/lat for plotting with leaflet/ggplot
+fi_no_beauchene <- st_transform(fi_no_beauchene_utm, 4326)
+fi <- fi_no_beauchene
+```
+  
+Remove extended trips from 2026
+```{r}
+# remove only the extended-trip portion for selected birds, not the whole track (for mapping)
+extended_trip_cutoffs <- tibble(
+  tagnumber = c("32748", "31583"),
+  cutoff_datetime = as.POSIXct(
+    c("2026-01-16 00:06:00",   # start of long trip for 32748
+      "2026-01-16 00:10:00"),  # start of long trip for 31583
+    tz = "UTC"
+  )
+)
+
+tracks <- tracks %>%
+  mutate(tagnumber = as.character(tagnumber))
+         
+tracks <- tracks %>%
+  left_join(extended_trip_cutoffs, by = "tagnumber") %>%
+  filter(is.na(cutoff_datetime) | datetime < cutoff_datetime) %>%
+  select(-cutoff_datetime)
+```
+
+
+# Facet comparison map
+```{r}
+lon_min <- min(tracks$long, na.rm = TRUE) - 0.002
+lon_max <- max(tracks$long, na.rm = TRUE) + 0.002
+lat_min <- min(tracks$lat, na.rm = TRUE) - 0.002
+lat_max <- max(tracks$lat, na.rm = TRUE) + 0.002
+
+
+label_df <- data.frame(
+  deploymentid = c("2025-01-Hummock", "2026-01-Hummock"),
+  x = lon_max - 0.002,
+  y = lat_min + 0.02
+)
+
+
+p_facet <- ggplot() +
+  geom_sf(data = fi, fill = "grey70", colour = "grey50", linewidth = 0.3) +
+  geom_path(data = tracks,
+            aes(x = long, y = lat, group = tagnumber, colour = deploymentid),
+            linewidth = 0.8, alpha = 0.70, show.legend = FALSE) +
+  facet_wrap(~deploymentid, ncol = 2) +
+
+    # Coordinates extent
+  coord_sf(xlim = c(lon_min, lon_max),
+           ylim = c(lat_min, lat_max),
+           expand = FALSE) +
+  
+  scale_colour_manual(values = c(
+    "2025-01-Hummock" = "salmon",
+    "2026-01-Hummock" = "#25C9D0"
+  )) +
+  
+  geom_label(
+    data = label_df,
+    aes(x = x, y = y, label = deploymentid),
+    inherit.aes = FALSE,
+    hjust = 1, vjust = 1,
+    fill = "white", colour = "black",
+    label.size = 0, size = 5
+  ) +
+  
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_line(colour = "grey85", linewidth = 0.2),
+    strip.text = element_blank(),
+    legend.position = "bottom",
+    legend.text = element_text(colour="white", size=20),
+    legend.title = element_blank(),
+    axis.title = element_blank()
+  )
+
+
+p_facet
+```
+
+```{r}
+ggsave(filename = file.path("C:/Users/r01dp24/OneDrive - University of Aberdeen/Documents/PhD/05-Data/02 - Tracking data/03 - Processed data/2025-26_Hummock_comparison.png"),
+       plot = p_facet,
+       width = 23.64,
+       height = 18.90,
+       dpi = 300,
+       unit = "cm"
+)
+```
+  
+# Overlay map
+```{r}
+p_overlay <- ggplot() +
+  geom_sf(data = fi, fill = "grey85", colour = "grey70", linewidth = 0.3) +
+  
+  # 2025 FIRST (background)
+  geom_path(
+    data = tracks %>% filter(deploymentid == "2025-01-Hummock"),
+    aes(x = long, y = lat, group = tagnumber),
+    colour = "salmon",
+    linewidth = 0.8,
+    alpha = 0.7
+  ) +
+
+  # 2026 SECOND (on top)
+  geom_path(
+    data = tracks %>% filter(deploymentid == "2026-01-Hummock"),
+    aes(x = long, y = lat, group = tagnumber),
+    colour = "#25C9D0",
+    linewidth = 0.8,
+    alpha = 0.7
+  ) +
+  
+  coord_sf(xlim = c(lon_min, lon_max),
+           ylim = c(lat_min, lat_max),
+           expand = FALSE) +
+
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major = element_line(colour = "grey80", linewidth = 0.4),
+    axis.title = element_blank(),
+    legend.title = element_blank()
+  )
+
+p_overlay
+```
+
+```{r}
+ggsave(filename = file.path("C:/Users/r01dp24/OneDrive - University of Aberdeen/Documents/PhD/05-Data/02 - Tracking data/03 - Processed data/2025-26_Hummock_overlay_white.png"),
+       plot = p_overlay,
+       width = 23.64,
+       height = 18.90,
+       dpi = 300,
+       unit = "cm"
+)
+```
+  
+  
+# Overlay map for poster (transparant background)
+```{r}
+p_overlay2 <- ggplot() +
+  geom_sf(data = fi, fill = "#FFFEEF", colour = "grey70", linewidth = 0.3) + 
+  
+  # 2025 FIRST (background)
+  geom_path(
+    data = tracks %>% filter(deploymentid == "2025-01-Hummock"),
+    aes(x = long, y = lat, group = tagnumber),
+    colour = "#FFC000",
+    linewidth = 2,
+    alpha = 0.8
+  ) +
+
+  # 2026 SECOND (on top)
+  geom_path(
+    data = tracks %>% filter(deploymentid == "2026-01-Hummock"),
+    aes(x = long, y = lat, group = tagnumber),
+    colour = "#6DDFE5",#"#25C9D0",
+    linewidth = 2,
+    alpha = 0.8
+  ) +
+  
+  #scale_color_hue(l = 75, c = 100) + 
+  #c = chroma (colour intensity / saturation), Range: ~0 (grey) → ~100+ (very vivid)
+  #l = luminance (brightness), Range: ~0 (black) → 100 (white)
+  
+  coord_sf(xlim = c(lon_min, lon_max),
+           ylim = c(lat_min, lat_max),
+           expand = FALSE) +
+
+  theme_void() +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "none",
+    axis.title = element_blank(),
+    axis.text = element_text(colour = "grey", size = 28),
+    panel.grid.major = element_line(colour="grey80", linewidth = 0.4),
+    axis.text.y = element_text(margin = margin(r = 5)), #(r)ight, (l)eft
+    axis.text.x = element_text(margin = margin(t = 5))) #(t)op, (b)ottom
+
+p_overlay2
+```
+  
+```{r}
+ggsave(filename = file.path("C:/Users/r01dp24/OneDrive - University of Aberdeen/Documents/PhD/05-Data/02 - Tracking data/03 - Processed data/2025-26_Hummock_overlay_white.png"),
+       plot = p_overlay2,
+       width = 63,
+       height = 55,
+       dpi = 300,
+       unit = "cm"
+)
+```

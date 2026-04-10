@@ -1,0 +1,646 @@
+---
+title: "05 - Movement metrics and ars"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+# Show code in the knitted report, but suppress warnings/messages for readability.
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+# Purpose
+
+This script focuses on **movement metrics within retained foraging
+trips**.
+
+It starts from the clean analysis objects created by
+`03_setup_and_load.Rmd` and uses `momentuHMM::prepData()` to derive the
+usual movement data streams used in movement ecology:
+
+-   **step length**
+-   **turning angle**
+
+This script is intentionally **descriptive and exploratory**.
+
+It does **not** fit a Hidden Markov Model. Instead, it:
+
+1.  loads the clean point-level and trip-level datasets\
+2.  keeps only points belonging to final retained trips\
+3.  computes movement metrics using `momentuHMM`\
+4.  explores **data-driven ARS thresholds** and runs a simple
+    **sensitivity analysis**
+
+This script helps understand the shape of the movement data first, and
+then script 06 can handle the formal HMM analysis separately.
+
+ARS = area-restricted search It is inferred from movement patterns. The
+indicators are:
+
+-   low speed (or short step lengths)
+
+-   high turning angles
+
+-   sometimes high residence time
+  
+# Packages
+```{r packages}
+library(dplyr) # data manipulation
+library(readr) # writing csv outputs
+library(lubridate) # time handling
+library(ggplot2) # plotting
+library(openxlsx) # writing Excel workbook
+library(tidyr) # reshaping tables
+library(purrr) # looping over threshold combinations cleanly
+library(momentuHMM) # movement-ecology tools based on step length and turning angle
+```
+  
+# Project folders
+```{r folders}
+# Use the current working directory as the project root.
+project_dir <- getwd()
+
+# Folder containing the analysis-ready objects from script 00.
+input_dir <- file.path(project_dir, "outputs", "03_setup_and_load")
+
+# Output folder for this script.
+output_dir <- file.path(project_dir, "outputs", "05_movement_metrics_and_ars")
+
+# Create the output folder if it does not already exist.
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+  
+# Helper functions
+```{r helpers}
+# Simple plotting theme used throughout this script.
+theme_paper <- function() {
+  theme_minimal() +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(colour = "grey85", linewidth = 0.4),
+      axis.text = element_text(colour = "grey20"),
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5),
+      legend.position = "right"
+    )
+}
+
+# Simple first-pass ARS classifier.
+# This is exploratory and descriptive, not a final behavioural model.
+# A point/step is classified as ARS when:
+# - speed is below the chosen threshold
+# - absolute turning angle is above the chosen threshold
+classify_ars_simple <- function(speed_kmh, turn_angle_deg,
+                                speed_threshold,
+                                angle_threshold) {
+  dplyr::case_when(
+    !is.na(speed_kmh) & !is.na(turn_angle_deg) &
+      speed_kmh < speed_threshold & turn_angle_deg > angle_threshold ~ "ARS",
+    !is.na(speed_kmh) & !is.na(turn_angle_deg) ~ "Transit",
+    TRUE ~ NA_character_
+  )
+}
+
+# Bearing helper:
+# compute the initial bearing in degrees between two longitude/latitude points.
+# This is used to create an easy-to-interpret heading variable.
+calculate_bearing_deg <- function(lon1, lat1, lon2, lat2) {
+  lon1 <- lon1 * pi / 180
+  lat1 <- lat1 * pi / 180
+  lon2 <- lon2 * pi / 180
+  lat2 <- lat2 * pi / 180
+
+  y <- sin(lon2 - lon1) * cos(lat2)
+  x <- cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(lon2 - lon1)
+
+  bearing <- atan2(y, x) * 180 / pi
+  (bearing + 360) %% 360
+}
+```
+  
+# Load the analysis-ready inputs
+```{r load-inputs}
+# Load the clean point-level tracking object.
+tracks <- readRDS(file.path(input_dir, "tracks_clean.rds"))
+
+# Load the clean trip-level object.
+trips <- readRDS(file.path(input_dir, "trips_clean.rds"))
+
+# Load the clean QA object.
+qa <- readRDS(file.path(input_dir, "qa_clean.rds"))
+```
+  
+# Keep only points belonging to retained final trips
+```{r subset-final-trip-points}
+# Keep only points assigned to final retained trips.
+tracks_trip_points <- tracks %>%
+  filter(!is.na(global_trip_id)) %>%
+  arrange(bird_id, global_trip_id, datetime)
+
+# Print quick checks so you can confirm the filtered dataset.
+cat("Points in final retained trips:", nrow(tracks_trip_points), "\n")
+cat("Trips represented in point data:", dplyr::n_distinct(tracks_trip_points$global_trip_id), "\n")
+```
+  
+# Build the input table for `momentuHMM::prepData()`
+```{r prep-input-table}
+# `prepData()` expects a regular data frame with coordinates, time, and IDs.
+# We keep useful identifiers so they remain available after movement metrics are calculated.
+mhmm_input <- tracks_trip_points %>%
+  transmute(
+    bird_id = bird_id,
+    deploymentid = deploymentid,
+    tagnumber = tagnumber,
+    global_trip_id = global_trip_id,
+    year_season = year_season,
+    dateTime = datetime,
+    x = long,
+    y = lat
+  ) %>%
+  rename(ID = global_trip_id) %>%
+  arrange(ID, dateTime)
+
+# Convert to a plain data.frame because `prepData()` is more reliable with that structure.
+mhmm_input_df <- as.data.frame(mhmm_input)
+```
+  
+# Calculate step lengths and turning angles with `momentuHMM`
+```{r prepdata}
+# `prepData()` calculates:
+# - step length (`step`)
+# - turning angle (`angle`)
+#
+# We use type = "LL" because the coordinates are longitude/latitude.
+# In this mode, step lengths are calculated in kilometres and turning angles are derived from initial bearings.
+movement_metrics <- momentuHMM::prepData(
+  data = mhmm_input_df,
+  type = "LL",
+  coordNames = c("x", "y") #have to specify if your lat,long are named differently than x,y
+) %>%
+  as_tibble()
+```
+  
+# Add useful movement metrics
+```{r add-movement-metrics}
+# Add speed, turning angles in degrees, and a few convenience columns.
+movement_metrics <- movement_metrics %>%
+  group_by(ID) %>%
+  arrange(dateTime, .by_group = TRUE) %>%
+  mutate(
+    # Calculate time lag between consecutive fixes in hours.
+    dt_h = as.numeric(difftime(dateTime, lag(dateTime), units = "hours")),
+
+    # Calculate speed in km/h from step length and time lag.
+    speed_kmh = step / dt_h,
+
+    # Convert turning angle from radians to degrees.
+    turn_angle_deg = angle * 180 / pi,
+
+    # Store the absolute turning angle as a simpler measure of tortuosity.
+    abs_turn_angle_deg = abs(turn_angle_deg)
+  ) %>%
+  ungroup()
+```
+  
+# Add headings between consecutive locations
+```{r add-headings}
+# Compute headings directly from consecutive longitude/latitude positions within each trip.
+heading_tbl <- mhmm_input %>%
+  group_by(ID) %>%
+  arrange(dateTime, .by_group = TRUE) %>%
+  mutate(
+    heading_deg = calculate_bearing_deg(x, y, lead(x), lead(y)),
+    heading_rad = heading_deg * pi / 180
+  ) %>%
+  ungroup() %>%
+  select(ID, dateTime, heading_rad, heading_deg)
+
+# Join headings back to the movement metrics table.
+movement_metrics <- movement_metrics %>%
+  left_join(
+    heading_tbl,
+    by = c("ID", "dateTime")
+  )
+```
+  
+# Quick inspection of the movement-metrics table
+```{r inspect-movement-table}
+# Print the main column names so you can check that the expected variables exist.
+names(movement_metrics)
+
+# Show the first few rows for a quick manual check.
+head(movement_metrics)
+```
+  
+# Explore the empirical distributions
+```{r empirical-distributions}
+# Calculate empirical quantiles for speed.
+speed_quantiles <- quantile(
+  movement_metrics$speed_kmh,
+  probs = c(0.25, 0.33, 0.50),
+  na.rm = TRUE
+)
+
+# Calculate empirical quantiles for absolute turning angle.
+angle_quantiles <- quantile(
+  movement_metrics$abs_turn_angle_deg,
+  probs = c(0.50, 0.66, 0.75),
+  na.rm = TRUE
+)
+
+# Store them in tidy tables for export and easy inspection.
+speed_quantile_table <- tibble::tibble(
+  quantile_label = c("25%", "33%", "50%"),
+  speed_threshold_kmh = as.numeric(speed_quantiles)
+)
+
+angle_quantile_table <- tibble::tibble(
+  quantile_label = c("50%", "66%", "75%"),
+  angle_threshold_deg = as.numeric(angle_quantiles)
+)
+
+speed_quantile_table
+angle_quantile_table
+```
+  
+# Build candidate threshold combinations
+```{r threshold-grid}
+# Build a small grid of candidate threshold combinations for sensitivity analysis.
+threshold_grid <- tidyr::expand_grid(
+  speed_threshold_kmh = as.numeric(speed_quantiles),
+  angle_threshold_deg = as.numeric(angle_quantiles)
+) %>%
+  arrange(speed_threshold_kmh, angle_threshold_deg)
+
+threshold_grid
+```
+  
+# Run the threshold sensitivity analysis
+```{r sensitivity-analysis}
+# For each threshold combination, classify ARS and summarise the results.
+sensitivity_results <- purrr::map_dfr(seq_len(nrow(threshold_grid)), function(i) {
+
+  # Extract one threshold combination.
+  s_thr <- threshold_grid$speed_threshold_kmh[i]
+  a_thr <- threshold_grid$angle_threshold_deg[i]
+
+  # Apply the simple ARS classifier to all steps.
+  tmp <- movement_metrics %>%
+    mutate(
+      ars_state = classify_ars_simple(
+        speed_kmh = speed_kmh,
+        turn_angle_deg = abs_turn_angle_deg,
+        speed_threshold = s_thr,
+        angle_threshold = a_thr
+      )
+    )
+
+  # Summarise the proportion of ARS steps overall and by year.
+  tmp_summary <- tmp %>%
+    group_by(year_season) %>%
+    summarise(
+      n_steps = n(),
+      prop_ars = mean(ars_state == "ARS", na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      speed_threshold_kmh = s_thr,
+      angle_threshold_deg = a_thr
+    )
+
+  tmp_summary
+})
+
+# Reorder the columns for readability.
+sensitivity_results <- sensitivity_results %>%
+  select(
+    speed_threshold_kmh,
+    angle_threshold_deg,
+    year_season,
+    n_steps,
+    prop_ars
+  )
+```
+  
+# Choose one exploratory threshold set for descriptive plotting
+```{r choose-thresholds}
+# Choose one central threshold combination for the descriptive ARS plots.
+# Here we use:
+# - speed threshold = 33rd percentile
+# - angle threshold = 66th percentile
+#
+# This is not a final behavioural model.
+# It is simply a transparent, data-driven exploratory rule.
+selected_speed_threshold <- as.numeric(speed_quantiles[2])
+selected_angle_threshold <- as.numeric(angle_quantiles[2])
+
+# Apply the chosen descriptive threshold rule.
+movement_metrics_classified <- movement_metrics %>%
+  mutate(
+    ars_state = classify_ars_simple(
+      speed_kmh = speed_kmh,
+      turn_angle_deg = abs_turn_angle_deg,
+      speed_threshold = selected_speed_threshold,
+      angle_threshold = selected_angle_threshold
+    )
+  )
+```
+  
+# Summarise movement metrics by year
+```{r summaries-by-year}
+# Summarise the main movement metrics by year.
+movement_summary_by_year <- movement_metrics_classified %>%
+  group_by(year_season) %>%
+  summarise(
+    n_steps = n(),
+    mean_step_km = mean(step, na.rm = TRUE),
+    sd_step_km = sd(step, na.rm = TRUE),
+    mean_speed_kmh = mean(speed_kmh, na.rm = TRUE),
+    sd_speed_kmh = sd(speed_kmh, na.rm = TRUE),
+    mean_abs_turn_deg = mean(abs_turn_angle_deg, na.rm = TRUE),
+    sd_abs_turn_deg = sd(abs_turn_angle_deg, na.rm = TRUE),
+    prop_ars = mean(ars_state == "ARS", na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+  
+# Summarise movement metrics by trip
+```{r summaries-by-trip}
+# Summarise movement metrics within each retained trip.
+movement_summary_by_trip <- movement_metrics_classified %>%
+  group_by(ID) %>%
+  summarise(
+    n_steps = n(),
+    mean_step_km = mean(step, na.rm = TRUE),
+    sd_step_km = sd(step, na.rm = TRUE),
+    mean_speed_kmh = mean(speed_kmh, na.rm = TRUE),
+    sd_speed_kmh = sd(speed_kmh, na.rm = TRUE),
+    mean_abs_turn_deg = mean(abs_turn_angle_deg, na.rm = TRUE),
+    sd_abs_turn_deg = sd(abs_turn_angle_deg, na.rm = TRUE),
+    prop_ars = mean(ars_state == "ARS", na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+  
+
+
+
+
+
+# Simple year comparisons
+```{r year-comparisons}
+# Compare step length between 2025 and 2026.
+ttest_step_length <- t.test(
+  step ~ year_season,
+  data = movement_metrics_classified %>% filter(year_season %in% c("2025", "2026"))
+)
+
+# Compare speed between 2025 and 2026.
+ttest_speed <- t.test(
+  speed_kmh ~ year_season,
+  data = movement_metrics_classified %>% filter(year_season %in% c("2025", "2026"))
+)
+
+# Compare absolute turning angle between 2025 and 2026.
+ttest_turning <- t.test(
+  abs_turn_angle_deg ~ year_season,
+  data = movement_metrics_classified %>% filter(year_season %in% c("2025", "2026"))
+)
+
+# Store the comparison results in one compact table.
+year_comparison_table <- tibble::tibble(
+  metric = c("step_length_km", "speed_kmh", "abs_turn_angle_deg"),
+  p_value = c(ttest_step_length$p.value, ttest_speed$p.value, ttest_turning$p.value)
+)
+```
+
+# Figures
+```{r figures}
+# Histogram of step length.
+fig_step_hist <- ggplot(movement_metrics, aes(x = step)) +
+  geom_histogram(bins = 50) +
+  labs(
+    title = "Distribution of step length",
+    x = "Step length (km)",
+    y = "Count"
+  ) +
+  theme_paper()
+
+# Histogram of speed.
+fig_speed_hist <- ggplot(movement_metrics, aes(x = speed_kmh)) +
+  geom_histogram(bins = 50) +
+  labs(
+    title = "Distribution of speed",
+    x = "Speed (km/h)",
+    y = "Count"
+  ) +
+  theme_paper()
+
+# Histogram of absolute turning angle.
+fig_turn_hist <- ggplot(movement_metrics, aes(x = abs_turn_angle_deg)) +
+  geom_histogram(bins = 50) +
+  labs(
+    title = "Distribution of absolute turning angle",
+    x = "Absolute turning angle (degrees)",
+    y = "Count"
+  ) +
+  theme_paper()
+
+# Boxplot of step lengths by year.
+fig_step_length <- ggplot(movement_metrics_classified, aes(x = year_season, y = step)) +
+  geom_boxplot() +
+  labs(
+    title = "Step length by year",
+    x = "Year",
+    y = "Step length (km)"
+  ) +
+  theme_paper()
+
+# Boxplot of speed by year.
+fig_speed <- ggplot(movement_metrics_classified, aes(x = year_season, y = speed_kmh)) +
+  geom_boxplot() +
+  labs(
+    title = "Speed by year",
+    x = "Year",
+    y = "Speed (km/h)"
+  ) +
+  theme_paper()
+
+# Boxplot of absolute turning angle by year.
+fig_turn_angle <- ggplot(movement_metrics_classified, aes(x = year_season, y = abs_turn_angle_deg)) +
+  geom_boxplot() +
+  labs(
+    title = "Absolute turning angle by year",
+    x = "Year",
+    y = "Absolute turning angle (degrees)"
+  ) +
+  theme_paper()
+```
+
+
+```{r figures}
+# Barplot of ARS proportion by year for the selected exploratory thresholds.
+# If I define ARS using this speed + angle threshold, what % of time is classified as ARS?
+fig_ars_prop <- ggplot(movement_summary_by_year, aes(x = year_season, y = prop_ars)) +
+  geom_col() +
+  labs(
+    title = "Proportion of steps classified as ARS",
+    subtitle = paste0(
+      "Exploratory thresholds: speed < ",
+      round(selected_speed_threshold, 2),
+      " km/h and turning angle > ",
+      round(selected_angle_threshold, 2),
+      " degrees"
+    ),
+    x = "Year",
+    y = "Proportion ARS"
+  ) +
+  theme_paper()
+
+
+# Sensitivity plot showing how ARS proportion changes across threshold combinations.
+fig_sensitivity <- ggplot(
+  sensitivity_results,
+  aes(
+    x = factor(round(speed_threshold_kmh, 2)),
+    y = prop_ars,
+    fill = factor(round(angle_threshold_deg, 2))
+  )
+) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ year_season) +
+  labs(
+    title = "Sensitivity of ARS proportion to threshold choice",
+    x = "Speed threshold (km/h)",
+    y = "Proportion ARS",
+    fill = "Angle threshold\n(degrees)"
+  ) +
+  theme_paper()
+```
+
+Speed threshold (x-axis), going from: 1.07 → 1.39 → 2.21 km/h. You are becoming less strict on speed: higher threshold = more points counted as “slow”. Result: ARS proportion increases (bars get higher as you move right).  
+
+Turning angle threshold (colour):  
+-  Red (~22°) = very permissive = many turns counted as “tortuous”
+-  Green (~42°) = moderate
+-  Blue (~64°) = strict = only very sharp turns count
+Result: ARS proportion decreases as angle threshold increases (fewer movements qualify as “searching"). 
+
+Although the absolute proportion of ARS behaviour varies depending on the thresholds used, the relative difference between years is consistent, with higher ARS in 2025 than in 2026 across all tested parameter combinations.
+
+
+# Save figures
+```{r save-figures}
+ggsave(file.path(output_dir, "fig_step_length_histogram.png"), fig_step_hist, width = 7, height = 5, dpi = 300)
+ggsave(file.path(output_dir, "fig_speed_histogram.png"), fig_speed_hist, width = 7, height = 5, dpi = 300)
+ggsave(file.path(output_dir, "fig_turn_angle_histogram.png"), fig_turn_hist, width = 7, height = 5, dpi = 300)
+ggsave(file.path(output_dir, "fig_step_length_by_year.png"), fig_step_length, width = 7, height = 5, dpi = 300)
+ggsave(file.path(output_dir, "fig_speed_by_year.png"), fig_speed, width = 7, height = 5, dpi = 300)
+ggsave(file.path(output_dir, "fig_abs_turn_angle_by_year.png"), fig_turn_angle, width = 7, height = 5, dpi = 300)
+ggsave(file.path(output_dir, "fig_ars_proportion_by_year.png"), fig_ars_prop, width = 7, height = 5, dpi = 300)
+ggsave(file.path(output_dir, "fig_ars_sensitivity.png"), fig_sensitivity, width = 9, height = 5, dpi = 300)
+```
+
+# Save tables
+```{r save-tables}
+# Save the raw movement-metrics table.
+readr::write_csv(movement_metrics, file.path(output_dir, "movement_metrics_raw.csv"))
+
+# Save the classified movement-metrics table using the selected exploratory thresholds.
+readr::write_csv(movement_metrics_classified, file.path(output_dir, "movement_metrics_classified.csv"))
+
+# Save summaries.
+readr::write_csv(movement_summary_by_year, file.path(output_dir, "movement_summary_by_year.csv"))
+readr::write_csv(movement_summary_by_trip, file.path(output_dir, "movement_summary_by_trip.csv"))
+
+# Save the empirical threshold tables.
+readr::write_csv(speed_quantile_table, file.path(output_dir, "speed_quantile_table.csv"))
+readr::write_csv(angle_quantile_table, file.path(output_dir, "angle_quantile_table.csv"))
+readr::write_csv(threshold_grid, file.path(output_dir, "threshold_grid.csv"))
+
+# Save the sensitivity results.
+readr::write_csv(sensitivity_results, file.path(output_dir, "ars_sensitivity_results.csv"))
+
+# Save the compact year-comparison table.
+readr::write_csv(year_comparison_table, file.path(output_dir, "movement_year_comparison_table.csv"))
+```
+
+# Save a workbook of the main outputs
+```{r workbook}
+# Create a workbook to collect the main outputs from this script.
+wb <- openxlsx::createWorkbook()
+
+# Raw movement metrics.
+openxlsx::addWorksheet(wb, "movement_metrics_raw")
+openxlsx::writeData(wb, "movement_metrics_raw", movement_metrics)
+
+# Classified movement metrics.
+openxlsx::addWorksheet(wb, "movement_metrics_classified")
+openxlsx::writeData(wb, "movement_metrics_classified", movement_metrics_classified)
+
+# Year summary.
+openxlsx::addWorksheet(wb, "summary_by_year")
+openxlsx::writeData(wb, "summary_by_year", movement_summary_by_year)
+
+# Trip summary.
+openxlsx::addWorksheet(wb, "summary_by_trip")
+openxlsx::writeData(wb, "summary_by_trip", movement_summary_by_trip)
+
+# Speed quantiles.
+openxlsx::addWorksheet(wb, "speed_quantiles")
+openxlsx::writeData(wb, "speed_quantiles", speed_quantile_table)
+
+# Angle quantiles.
+openxlsx::addWorksheet(wb, "angle_quantiles")
+openxlsx::writeData(wb, "angle_quantiles", angle_quantile_table)
+
+# Sensitivity results.
+openxlsx::addWorksheet(wb, "ars_sensitivity")
+openxlsx::writeData(wb, "ars_sensitivity", sensitivity_results)
+
+# Year comparisons.
+openxlsx::addWorksheet(wb, "year_comparisons")
+openxlsx::writeData(wb, "year_comparisons", year_comparison_table)
+
+# Save the workbook.
+openxlsx::saveWorkbook(
+  wb,
+  file.path(output_dir, "02_movement_metrics_and_ars_outputs.xlsx"),
+  overwrite = TRUE
+)
+```
+
+# End
+```{r end}
+cat("02_movement_metrics_and_ars completed successfully.\n")
+cat("Outputs saved in:", output_dir, "\n")
+```
+
+The movement metrics derived in this analysis provide a detailed description of the fine-scale behaviour of rockhopper penguins during foraging trips. Step length and speed quantify how birds move through space, while turning angles capture the geometry of movement paths and provide insight into behavioural modes.  
+  
+Step lengths and speeds together distinguish between directed transit and localised movement. Larger step lengths and higher speeds indicate commuting behaviour, typically associated with travel between the colony and foraging areas. In contrast, shorter steps and reduced speeds suggest area-restricted movement, potentially reflecting active foraging.  
+  
+Turning angles complement this interpretation. Low turning angles indicate straight trajectories consistent with transit, whereas high absolute turning angles reflect tortuous movement paths. Such tortuosity is widely interpreted as evidence of area-restricted search (ARS), where animals intensify their search effort in regions of higher prey availability.  
+  
+To explore this behaviour, a simple, data-driven classification of ARS was applied based on combinations of low speed and high turning angle. While this approach is exploratory and not model-based, it provides an initial estimate of the proportion of time spent in searching versus transit behaviour. The sensitivity analysis across multiple threshold
+combinations demonstrates whether this classification is robust or highly dependent on parameter choice.  
+  
+Comparisons between years (2025 and 2026) reveal potential differences in movement structure. For example, shifts in mean step length, speed, or turning angle may indicate changes in foraging strategy, prey distribution, or environmental conditions. Differences in the proportion of ARS behaviour can be interpreted as changes in search effort, with
+higher ARS potentially reflecting more dispersed or less predictable prey fields.  
+  
+Statistical comparisons (t-tests) provide an initial indication of whether these differences are significant, although they should be interpreted cautiously given the temporal autocorrelation inherent in movement data. These results therefore serve as a descriptive and exploratory foundation for subsequent modelling approaches, such as
+Hidden Markov Models, which can more rigorously infer behavioural states.  
+  
+Overall, this analysis establishes a quantitative baseline of movement behaviour and provides key insights into how rockhopper penguins use space during foraging trips, setting the stage for more advanced behavioural and environmental analyses.  
+  
+If 2025 has more ARS, penguins are searching more moving more tortuously spending more time in localised behaviour. Possible interpretations: (i) prey more dispersed, (ii) prey less predictable, (iii) environment more challenging.
+If 2026 has less ARS, penguins are undertaken more direct trips possibly reflecting better prey conditions.

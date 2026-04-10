@@ -1,0 +1,224 @@
+---
+title: "03 - Setup and data load"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+# Set global chunk options so code is shown and warnings/messages do not clutter the document.
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+# Purpose
+
+This script is **not** a second raw-data cleaning pipeline.
+
+The trip-identification script (02) has already done the following:
+- reading the raw CSV files
+- parsing timestamps
+- assigning colony information
+- identifying trips
+- applying QA and overrides
+- exporting clean outputs
+
+So here, we only do a **light analysis setup step**:
+- load the outputs from that workflow
+- make sure key columns have the right type for downstream analyses
+- create a few convenient fields such as `bird_id` and `year_season`
+- save analysis-ready `.rds` files for the later scripts
+
+# Packages
+```{r packages}
+library(dplyr) # data manipulation
+library(readr) # reading and writing csv files
+library(lubridate) # date-time parsing and date helpers
+library(openxlsx) # optional Excel writing for metadata outputs
+```
+
+# Project folders
+```{r folders}
+# Use the current working directory as the project root.
+project_dir <- getwd()
+
+# Folder containing outputs produced by your trip-identification workflow.
+input_dir <- file.path(project_dir, "visualisation")
+
+# Root folder for the new paper-analysis workflow.
+output_root <- file.path(project_dir, "outputs")
+
+# Folder for the clean, analysis-ready objects created by this script.
+output_dir <- file.path(output_root, "03_setup_and_load")
+
+# Create the output folders if they do not already exist.
+dir.create(output_root, recursive = TRUE, showWarnings = FALSE)
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Input files
+```{r input-files}
+# Final trip-level table exported by your trip-identification script.
+trips_file <- file.path(input_dir, "RH_FORAGING_TRIPS.csv")
+
+# Point-level tracking table with final trip IDs pushed back to points.
+tracks_file <- file.path(input_dir, "RH_TRACK_POINTS_WITH_GLOBAL_TRIP_ID.csv")
+
+# QA table describing accepted and rejected trip candidates.
+qa_file <- file.path(input_dir, "RH_TRIP_QA_TABLE.csv")
+
+# Stop immediately if any required file is missing.
+if (!file.exists(trips_file)) stop("Missing file: ", trips_file)
+if (!file.exists(tracks_file)) stop("Missing file: ", tracks_file)
+if (!file.exists(qa_file)) stop("Missing file: ", qa_file)
+```
+
+# Helper function
+```{r helper-function}
+# This helper creates a simple year label from the deployment ID.
+# It is only for downstream analysis convenience.
+classify_year_season <- function(deploymentid_vec) {
+  dplyr::case_when(
+    grepl("^2025", deploymentid_vec) ~ "2025",
+    grepl("^2026", deploymentid_vec) ~ "2026",
+    TRUE ~ "other"
+  )
+}
+```
+
+# Load the already-clean outputs
+```{r load-data}
+# Read the trip-level table.
+trips <- readr::read_csv(trips_file, show_col_types = FALSE)
+
+# Read the point-level track table.
+tracks <- readr::read_csv(tracks_file, show_col_types = FALSE)
+
+# Read the QA table.
+qa <- readr::read_csv(qa_file, show_col_types = FALSE)
+```
+
+# Standardise the track table for downstream analysis
+```{r standardise-tracks}
+# Make sure that the columns needed by later analyses have the right type.
+
+tracks <- tracks %>%
+  mutate(
+    # Parse the tracking datetime as a proper POSIXct object.
+    datetime = lubridate::ymd_hms(datetime, quiet = TRUE),
+
+    # # Create a pure date field for daily summaries and plotting.
+    # date = as.Date(datetime),
+
+    # Keep identifiers as character strings to avoid factor/numeric mismatches.
+    deploymentid = as.character(deploymentid),
+    tagnumber = as.character(tagnumber),
+
+    # # Rebuild a unique bird ID in a consistent format.
+    # bird_id = paste(deploymentid, tagnumber, sep = "_"),
+
+    # Add a simple year label for 2025 vs 2026 analyses.
+    year_season = classify_year_season(deploymentid)
+  ) %>%
+  # Keep the rows ordered within each bird.
+  arrange(deploymentid, tagnumber, datetime)
+```
+
+# Standardise the trip table for downstream analysis
+```{r standardise-trips}
+# Creating analysis-friendly fields from the already-clean trip output.
+
+trips <- trips %>%
+  mutate(
+    # Keep identifiers as character strings.
+    deploymentid = as.character(deploymentid),
+    tag = as.character(tag),
+
+    # Rebuild bird_id in the same format used in the tracks table.
+    bird_id = paste(deploymentid, tag, sep = "_"),
+
+    # Parse trip start and end datetimes from the saved date/time fields.
+    trip_start = lubridate::ymd_hms(paste(start_date, start_time), quiet = TRUE),
+    trip_end = lubridate::ymd_hms(paste(end_date, end_time), quiet = TRUE),
+
+    # Add a simple year label for 2025 vs 2026 comparisons.
+    year_season = classify_year_season(deploymentid)
+  ) %>%
+  # Keep trips ordered within each bird.
+  arrange(deploymentid, tag, trip_start)
+```
+
+# Standardise the QA table for downstream analysis
+```{r standardise-qa}
+# The QA table is useful later when we want to trace back accepted/rejected segments.
+# Here we only standardise types and parse the key datetime fields.
+
+qa <- qa %>%
+  mutate(
+    # Keep identifiers as character strings.
+    deploymentid = as.character(deploymentid),
+    tagnumber = as.character(tagnumber),
+
+    # Create the same bird_id format used elsewhere.
+    bird_id = paste(deploymentid, tagnumber, sep = "_"),
+
+    # Parse segment-level datetimes if present.
+    start_datetime = lubridate::ymd_hms(start_datetime, quiet = TRUE),
+    end_datetime = lubridate::ymd_hms(end_datetime, quiet = TRUE),
+
+    # Parse trip-window datetimes if present.
+    trip_window_start_datetime = lubridate::ymd_hms(trip_window_start_datetime, quiet = TRUE),
+    trip_window_end_datetime = lubridate::ymd_hms(trip_window_end_datetime, quiet = TRUE),
+
+    # Add the simple year label.
+    year_season = classify_year_season(deploymentid)
+  ) %>%
+  # Keep QA rows ordered within bird.
+  arrange(deploymentid, tagnumber, trip_window_start_datetime)
+```
+
+# Quick checks
+```{r checks}
+# Print a few high-level checks so you can confirm the objects loaded as expected.
+cat("Number of tracking points:", nrow(tracks), "\n")
+cat("Number of trips:", nrow(trips), "\n")
+cat("Number of QA rows:", nrow(qa), "\n")
+cat("Number of birds in tracking table:", dplyr::n_distinct(tracks$bird_id), "\n")
+cat("Number of birds with trips:", dplyr::n_distinct(trips$bird_id), "\n")
+```
+
+# Save the analysis-ready objects
+```{r save-rds}
+# Save the standardised track table as an RDS object.
+saveRDS(tracks, file.path(output_dir, "tracks_clean.rds"))
+
+# Save the standardised trip table as an RDS object.
+saveRDS(trips, file.path(output_dir, "trips_clean.rds"))
+
+# Save the standardised QA table as an RDS object.
+saveRDS(qa, file.path(output_dir, "qa_clean.rds"))
+```
+
+# Save a small metadata table
+```{r save-metadata}
+# Create a small metadata table so you can quickly check what was saved.
+metadata_tbl <- tibble::tibble(
+  object_name = c("tracks", "trips", "qa"),
+  file_name = c("tracks_clean.rds", "trips_clean.rds", "qa_clean.rds"),
+  n_rows = c(nrow(tracks), nrow(trips), nrow(qa)),
+  created_on = as.character(Sys.time())
+)
+
+# Save the metadata table as CSV.
+readr::write_csv(metadata_tbl, file.path(output_dir, "setup_metadata.csv"))
+```
+
+# End
+```{r end}
+cat("03_setup_and_load completed successfully.\n")
+cat("Outputs saved in:", output_dir, "\n")
+```

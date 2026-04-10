@@ -1,0 +1,1287 @@
+---
+title: "05 - Habitat Use (Autocorrelation-Aware KDE + Environmental Covariates)"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+# Purpose
+This script is a **separate workflow** from `04_trip_metrics.Rmd`, focused on:
+
+1. estimating space use with kernel-type utilization distributions while accounting for serial autocorrelation in tracking data;
+2. fitting environmental-covariate habitat models with an autocorrelation-aware likelihood.
+
+The workflow is designed for seabird central-place foraging tracks and uses the cleaned inputs from `outputs/03_setup_and_load`.
+
+# Method choice (literature-informed)
+Why this approach:
+
+- **Classical KDE is widely used in seabird conservation workflows** (e.g., `track2KBA` / mIBA-style analyses), but requires careful smoothing and representativeness checks.
+- **Tracking data are typically autocorrelated**, and IID KDE can be biased on modern high-frequency data.
+- **AKDE (autocorrelated KDE)** from `ctmm` is specifically designed for autocorrelated telemetry and is generally preferred for robust home-range/UD estimation.
+- For covariates, **integrated RSF/iRSF with autocorrelation-adjusted likelihood** is preferable to naive used-vs-available models that ignore serial dependence.
+
+References used to guide this script:
+
+- Fleming et al. 2015 (AKDE): https://doi.org/10.1890/14-2010.1
+- Noonan et al. 2019 (autocorrelation bias in home-range estimators): https://doi.org/10.1002/ecm.1344
+- ctmm package / AKDE / RSF docs: https://ctmm-initiative.github.io/ctmm/
+- Alston et al. 2023 (autocorrelation-informed RSF weighting): https://doi.org/10.1111/2041-210X.14025
+- track2KBA paper (seabird-oriented KDE workflow context): https://ueaeprints.uea.ac.uk/81330/1/Accepted_Manuscript.pdf
+- Example seabird habitat-model workflow combining distributions + environmental covariates:
+  https://link.springer.com/article/10.1007/s00300-018-2404-4
+
+# 1. Setup
+## 1.1 Packages
+```{r packages}
+required_packages <- c(
+  "dplyr", "tidyr", "purrr", "stringr", "lubridate",
+  "ggplot2", "readr", "sf", "terra", "raster", "ctmm"
+)
+
+
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+
+if (length(missing_packages) > 0) {
+  stop(
+    paste0(
+      "Missing required packages: ",
+      paste(missing_packages, collapse = ", "),
+      ".\nInstall them before running this script."
+    )
+  )
+}
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(readr)
+library(sf)
+library(terra)
+library(raster)
+library(ctmm)
+```
+
+## 1.2 Folders
+```{r folders}
+project_dir <- getwd()
+input_dir <- file.path(project_dir, "outputs", "03_setup_and_load")
+output_dir <- file.path(project_dir, "outputs", "05_habitat_use_kde_environment")
+fig_dir <- file.path(output_dir, "figures")
+table_dir <- file.path(output_dir, "tables")
+model_dir <- file.path(output_dir, "models")
+akde_raster_dir <- file.path(output_dir, "akde_rasters")
+akde_vector_dir <- file.path(output_dir, "akde_vectors")
+env_input_dir <- file.path(output_dir, "inputs_env")
+map_input_dir <- file.path(output_dir, "inputs_map")
+env_projected_dir <- file.path(output_dir, "env_projected")
+rsf_map_dir <- file.path(output_dir, "rsf_maps")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(model_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(akde_raster_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(akde_vector_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(env_input_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(map_input_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(env_projected_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(rsf_map_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 1.3 User settings
+```{r settings}
+# Use at-sea locations only for habitat-use inference.
+at_sea_state_label <- "OUT"
+
+# Optional land polygon (recommended for publication-style maps).
+# Put a coastline/land polygon in inputs_map and set this path.
+# Supported formats include .gpkg / .shp.
+land_vector_path <- if (file.exists(file.path(project_dir, "FI_minusBeauchene.shp"))) {
+  file.path(project_dir, "FI_minusBeauchene.shp")
+} else {
+  file.path(map_input_dir, "falklands_land.gpkg")
+}
+
+# Dataset scope:
+# - "trimmed": excludes trips whose max_distance_colony_km > extended_trip_threshold_km
+# - "full": keeps all trips
+analysis_dataset <- "trimmed"
+extended_trip_threshold_km <- 250
+
+# Confidence and utilization levels for area summaries.
+ci_level <- 0.95
+ud_levels <- c(0.50, 0.95)
+
+# Number of individual variograms to plot as diagnostics.
+n_variogram_examples <- 6
+
+# Speed controls for AKDE (section 3.3)
+# These settings strongly affect runtime.
+akde_use_model_selection <- FALSE  # FALSE = ctmm.fit on initial guess (faster), TRUE = ctmm.select (slower, more exhaustive)
+akde_use_weights <- FALSE          # TRUE is more robust to sampling bias but slower
+akde_res <- 6                      # Smaller = coarser raster, faster (default ctmm is often finer)
+akde_error <- 0.01                 # Higher tolerated numerical error = faster (default often 0.001)
+
+# Force all AKDEs onto a fixed grid resolution (meters) for compatibility when averaging UDs.
+# Set to NULL to let ctmm choose individual-specific grids (can cause mean.UD grid mismatch).
+akde_grid_dr_m <- c(5000, 5000)
+
+# Optional thinning for very high-frequency tracks.
+# Set to NULL to disable, or e.g. 10 for ~10-minute thinning.
+thin_to_minutes <- NULL
+
+# Optional minimum fixes required per individual to fit AKDE.
+min_fixes_per_individual <- 30
+
+# Statistical resampling settings for overlap inference.
+# Increase to 1000+ for final inference if compute time allows.
+n_overlap_boot <- 300
+n_overlap_perm <- 300
+
+# Publication map settings.
+year_map_contours <- c(0.50, 0.75, 0.95)
+map_palette <- "C"
+```
+
+# 2. Load and prepare tracking data
+```{r load-prepare}
+tracks <- readRDS(file.path(input_dir, "tracks_clean.rds"))
+trips <- readRDS(file.path(input_dir, "trips_clean.rds"))
+
+# Select full or trimmed trip IDs.
+if (analysis_dataset == "trimmed") {
+  selected_trip_ids <- trips %>%
+    filter(max_distance_colony_km <= extended_trip_threshold_km) %>%
+    pull(global_trip_id) %>%
+    unique()
+} else if (analysis_dataset == "full") {
+  selected_trip_ids <- unique(trips$global_trip_id)
+} else {
+  stop("analysis_dataset must be either 'trimmed' or 'full'.")
+}
+
+tracks_at_sea <- tracks %>%
+  filter(global_trip_id %in% selected_trip_ids) %>%
+  filter(state == at_sea_state_label) %>%
+  mutate(
+    datetime = as.POSIXct(datetime, tz = "UTC"),
+    year_season = as.character(year_season),
+    bird_id = as.character(bird_id)
+  ) %>%
+  filter(!is.na(datetime), !is.na(long), !is.na(lat), !is.na(bird_id), !is.na(year_season)) %>%
+  arrange(year_season, bird_id, datetime) %>%
+  distinct(year_season, bird_id, datetime, .keep_all = TRUE)
+
+# Optional regular-time thinning for speed and comparability across years.
+if (!is.null(thin_to_minutes)) {
+  thin_seconds <- thin_to_minutes * 60
+  tracks_at_sea <- tracks_at_sea %>%
+    mutate(time_bin = floor(as.numeric(datetime) / thin_seconds)) %>%
+    group_by(year_season, bird_id, time_bin) %>%
+    slice(1) %>%
+    ungroup() %>%
+    select(-time_bin)
+}
+
+glimpse(tracks_at_sea)
+
+tracking_counts <- tracks_at_sea %>%
+  group_by(year_season) %>%
+  summarise(
+    n_points = n(),
+    n_individuals = n_distinct(bird_id),
+    .groups = "drop"
+  )
+
+tracking_counts
+
+readr::write_csv(tracking_counts, file.path(table_dir, "tracking_counts_after_filters.csv"))
+```
+
+## 2.2 Optional map layers (land + colony point)
+```{r map-layers}
+# Colony point from available metadata (for map reference).
+colony_ll <- tracks_at_sea %>%
+  summarise(
+    colony_lon = median(colony_lon, na.rm = TRUE),
+    colony_lat = median(colony_lat, na.rm = TRUE)
+  )
+
+colony_sf_ll <- sf::st_as_sf(colony_ll, coords = c("colony_lon", "colony_lat"), crs = 4326)
+
+# Optional land polygon.
+land_available <- file.exists(land_vector_path)
+land_sf_raw <- NULL
+if (land_available) {
+  land_sf_raw <- sf::st_read(land_vector_path, quiet = TRUE)
+}
+```
+
+## 2.1 Sampling-interval diagnostics (important for interpretation)
+```{r sampling-interval}
+sampling_diag <- tracks_at_sea %>%
+  group_by(bird_id, year_season) %>%
+  arrange(datetime, .by_group = TRUE) %>%
+  mutate(dt_min = as.numeric(difftime(datetime, lag(datetime), units = "mins"))) %>%
+  ungroup() %>%
+  filter(!is.na(dt_min), dt_min > 0, dt_min < 24 * 60)
+
+sampling_summary <- sampling_diag %>%
+  group_by(year_season) %>%
+  summarise(
+    n_intervals = n(),
+    mean_dt_min = mean(dt_min, na.rm = TRUE),
+    median_dt_min = median(dt_min, na.rm = TRUE),
+    q1_dt_min = quantile(dt_min, 0.25, na.rm = TRUE),
+    q3_dt_min = quantile(dt_min, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+sampling_summary
+
+readr::write_csv(sampling_summary, file.path(table_dir, "sampling_interval_summary_by_year.csv"))
+```
+
+```{r sampling-interval-fig}
+fig_sampling <- ggplot(sampling_diag, aes(x = year_season, y = dt_min)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  labs(
+    title = "Sampling interval by year",
+    subtitle = "Differences in fix interval can affect path-based metrics and should be reported",
+    x = "Year",
+    y = "Time between fixes (minutes)"
+  ) +
+  theme_minimal()
+
+fig_sampling
+
+ggsave(
+  file.path(fig_dir, "fig_sampling_interval_by_year.png"),
+  fig_sampling,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+# 3. Autocorrelation-aware KDE using ctmm (AKDE)
+## 3.1 Build telemetry objects
+```{r telemetry}
+# ctmm::as.telemetry expects Movebank-style column names.
+# Keep an explicit lookup table instead of parsing IDs with string splits later.
+id_lookup <- tracks_at_sea %>%
+  distinct(bird_id, year_season) %>%
+  arrange(year_season, bird_id)
+id_year_lookup <- setNames(id_lookup$year_season, id_lookup$bird_id)
+
+ctmm_df <- tracks_at_sea %>%
+  transmute(
+    individual.local.identifier = bird_id,
+    timestamp = format(datetime, "%Y-%m-%d %H:%M:%S"),
+    location.long = long,
+    location.lat = lat,
+    year_season = year_season,
+    bird_id = bird_id
+  )
+
+telemetry_list <- ctmm::as.telemetry(
+  ctmm_df,
+  timeformat = "%Y-%m-%d %H:%M:%S",
+  timezone = "UTC",
+  keep = TRUE,
+  drop = FALSE
+)
+
+if (!is.list(telemetry_list)) {
+  telemetry_list <- list(telemetry_list)
+}
+
+length(telemetry_list)
+```
+
+## 3.2 Variogram diagnostics for autocorrelation
+```{r variograms}
+example_ids <- names(telemetry_list)[seq_len(min(n_variogram_examples, length(telemetry_list)))]
+
+for (id in example_ids) {
+  vg <- ctmm::variogram(telemetry_list[[id]])
+  png(file.path(fig_dir, paste0("fig_variogram_", make.names(id), ".png")), width = 900, height = 600, res = 120)
+  plot(vg, main = paste("Variogram:", id))
+  dev.off()
+}
+```
+
+## 3.3 Fit movement models and AKDE per individual
+```{r fit-akde}
+fit_akde_one <- function(tel, id) {
+  n_fix <- tryCatch(nrow(as.data.frame(tel)), error = function(e) NA_integer_)
+
+  if (!is.na(n_fix) && n_fix < min_fixes_per_individual) {
+    return(list(
+      id = id,
+      fit = NULL,
+      ud = NULL,
+      n_fix = n_fix,
+      runtime_sec = NA_real_,
+      status = "skipped_too_few_fixes"
+    ))
+  }
+
+  t0 <- Sys.time()
+  guess <- ctmm::ctmm.guess(tel, interactive = FALSE)
+
+  fit <- if (akde_use_model_selection) {
+    ctmm::ctmm.select(tel, guess, trace = FALSE)
+  } else {
+    ctmm::ctmm.fit(tel, guess)
+  }
+
+  grid_arg <- if (is.null(akde_grid_dr_m)) {
+    NULL
+  } else {
+    list(dr = akde_grid_dr_m, align.to.origin = TRUE)
+  }
+
+  ud <- ctmm::akde(
+    tel,
+    fit,
+    weights = akde_use_weights,
+    res = akde_res,
+    error = akde_error,
+    grid = grid_arg
+  )
+
+  runtime_sec <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+
+  list(
+    id = id,
+    fit = fit,
+    ud = ud,
+    n_fix = n_fix,
+    runtime_sec = runtime_sec,
+    status = "ok"
+  )
+}
+
+akde_results <- purrr::imap(telemetry_list, ~purrr::possibly(fit_akde_one, otherwise = NULL)(.x, .y))
+akde_results <- akde_results[!vapply(akde_results, is.null, logical(1))]
+
+akde_runtime_table <- purrr::map_dfr(akde_results, ~tibble(
+  individual_id = .x$id,
+  n_fix = .x$n_fix,
+  runtime_sec = .x$runtime_sec,
+  status = .x$status
+)) %>%
+  left_join(id_lookup %>% rename(individual_id = bird_id), by = "individual_id") %>%
+  mutate(bird_id = individual_id, .after = individual_id) %>%
+  relocate(year_season, bird_id, .after = individual_id)
+
+readr::write_csv(akde_runtime_table, file.path(table_dir, "akde_runtime_by_individual.csv"))
+
+akde_runtime_table %>%
+  arrange(desc(runtime_sec))
+
+akde_results <- akde_results[vapply(akde_results, function(x) identical(x$status, "ok"), logical(1))]
+
+length(akde_results)
+```
+
+## 3.4 Summarise AKDE areas and export outputs
+```{r akde-summary-export}
+if (length(akde_results) == 0) {
+  stop("No successful AKDE fits. Check akde_runtime_by_individual.csv and speed/filter settings.")
+}
+
+# Robust extractor for ctmm summary output across versions.
+# Some versions return a list with $CI matrix, others return matrix/vector directly.
+extract_area_ci <- function(ud_object, ci_level, ud_level) {
+  sm <- summary(ud_object, level = ci_level, level.UD = ud_level, units = TRUE)
+  ci <- if (is.list(sm) && !is.null(sm$CI)) sm$CI else sm
+
+  if (is.data.frame(ci)) {
+    ci <- as.matrix(ci)
+  }
+
+  if (is.matrix(ci)) {
+    idx <- 1
+    if (!is.null(rownames(ci))) {
+      area_idx <- which(grepl("^area", rownames(ci), ignore.case = TRUE))
+      if (length(area_idx) > 0) idx <- area_idx[1]
+    }
+    row <- ci[idx, , drop = TRUE]
+    nm <- names(row)
+  } else {
+    row <- ci
+    nm <- names(row)
+  }
+
+  pick <- function(x, candidates, fallback_index = 1) {
+    hit <- intersect(candidates, names(x))
+    if (length(hit) > 0) return(as.numeric(x[[hit[1]]]))
+    as.numeric(x[[fallback_index]])
+  }
+
+  low <- pick(row, c("low", "LOW", "Low"), fallback_index = 1)
+  est <- pick(row, c("est", "EST", "Est", "estimate"), fallback_index = min(2, length(row)))
+  high <- pick(row, c("high", "HIGH", "High"), fallback_index = length(row))
+
+  tibble(
+    area_low = low,
+    area_estimate = est,
+    area_high = high
+  )
+}
+
+akde_area_table <- purrr::map_dfr(akde_results, function(res) {
+  purrr::map_dfr(ud_levels, function(level_ud) {
+    area_ci <- extract_area_ci(res$ud, ci_level = ci_level, ud_level = level_ud)
+    tibble(
+      individual_id = res$id,
+      ud_level = level_ud,
+      area_low = area_ci$area_low,
+      area_estimate = area_ci$area_estimate,
+      area_high = area_ci$area_high
+    ) %>%
+      mutate(across(c(area_low, area_estimate, area_high), as.numeric))
+  })
+}) %>%
+  left_join(id_lookup %>% rename(individual_id = bird_id), by = "individual_id") %>%
+  mutate(bird_id = individual_id, .after = individual_id) %>%
+  relocate(year_season, bird_id, .after = individual_id)
+
+readr::write_csv(akde_area_table, file.path(table_dir, "akde_area_summary.csv"))
+
+for (res in akde_results) {
+  id_safe <- make.names(res$id)
+
+  # Save fitted movement model and UD object.
+  saveRDS(res$fit, file.path(model_dir, paste0("ctmm_fit_", id_safe, ".rds")))
+  saveRDS(res$ud, file.path(model_dir, paste0("akde_ud_", id_safe, ".rds")))
+
+  # Save rasterized UD (probability mass function).
+  ud_pmf <- ctmm::raster(res$ud, DF = "PMF")
+  ctmm::writeRaster(ud_pmf, filename = file.path(akde_raster_dir, paste0("akde_pmf_", id_safe, ".tif")), overwrite = TRUE)
+
+  # Save UD contours (50% and 95%) as vector files.
+  contour_file <- file.path(akde_vector_dir, paste0("akde_contours_", id_safe, ".gpkg"))
+  if (file.exists(contour_file)) unlink(contour_file, recursive = TRUE, force = TRUE)
+  ctmm::writeVector(
+    res$ud,
+    filename = contour_file,
+    level.UD = ud_levels,
+    level = ci_level
+  )
+}
+```
+
+## 3.5 Mean AKDE by year and overlap
+```{r mean-akde-year}
+extract_overlap_ci <- function(overlap_obj, id1, id2) {
+  # ctmm::overlap usually returns a list with $CI[,,c("low","est","high")].
+  if (is.list(overlap_obj) && !is.null(overlap_obj$CI)) {
+    ci_array <- overlap_obj$CI
+    get_ci <- function(level_name) {
+      dims <- dim(ci_array)
+      if (is.null(dims) || length(dims) < 3) return(NA_real_)
+      dim3 <- dimnames(ci_array)[[3]]
+      if (is.null(dim3) || !level_name %in% dim3) return(NA_real_)
+      as.numeric(ci_array[id1, id2, level_name])
+    }
+    return(tibble(
+      overlap_low = get_ci("low"),
+      overlap_estimate = get_ci("est"),
+      overlap_high = get_ci("high")
+    ))
+  }
+
+  # Fallback for matrix-only outputs (estimate only, no CI).
+  if (is.matrix(overlap_obj) && all(c(id1, id2) %in% rownames(overlap_obj))) {
+    return(tibble(
+      overlap_low = NA_real_,
+      overlap_estimate = as.numeric(overlap_obj[id1, id2]),
+      overlap_high = NA_real_
+    ))
+  }
+
+  tibble(overlap_low = NA_real_, overlap_estimate = NA_real_, overlap_high = NA_real_)
+}
+
+akde_results_year <- purrr::map(akde_results, function(x) {
+  x$year_season <- unname(id_year_lookup[[x$id]])
+  x
+})
+
+akde_results_year <- akde_results_year[!is.na(vapply(akde_results_year, function(x) x$year_season, character(1)))]
+akde_by_year <- split(akde_results_year, vapply(akde_results_year, function(x) x$year_season, character(1)))
+
+year_ud <- purrr::imap(akde_by_year, function(res_year, yy) {
+  uds <- purrr::map(res_year, "ud")
+
+  # Try direct averaging first.
+  direct_mean <- tryCatch(mean(uds, sample = FALSE), error = function(e) e)
+  if (!inherits(direct_mean, "error")) {
+    return(direct_mean)
+  }
+
+  message("Grid mismatch while averaging UDs for ", yy, "; recomputing this year's UDs on a shared grid.")
+
+  ids <- purrr::map_chr(res_year, "id")
+  data_year <- telemetry_list[ids]
+  fit_year <- purrr::map(res_year, "fit")
+
+  shared_grid <- if (is.null(akde_grid_dr_m)) {
+    NULL
+  } else {
+    list(dr = akde_grid_dr_m, align.to.origin = TRUE)
+  }
+
+  uds_shared <- ctmm::akde(
+    data_year,
+    fit_year,
+    weights = akde_use_weights,
+    res = akde_res,
+    error = akde_error,
+    grid = shared_grid
+  )
+
+  mean(uds_shared, sample = FALSE)
+})
+
+for (yy in names(year_ud)) {
+  ud_r <- ctmm::raster(year_ud[[yy]], DF = "PMF")
+  ctmm::writeRaster(ud_r, filename = file.path(akde_raster_dir, paste0("akde_mean_pmf_", yy, ".tif")), overwrite = TRUE)
+
+  # Also save publication-ready contour polygons for year-level maps.
+  year_contour_file <- file.path(akde_vector_dir, paste0("akde_mean_contours_", yy, ".gpkg"))
+  if (file.exists(year_contour_file)) unlink(year_contour_file, recursive = TRUE, force = TRUE)
+  ctmm::writeVector(
+    year_ud[[yy]],
+    filename = year_contour_file,
+    level.UD = year_map_contours,
+    level = ci_level
+  )
+}
+
+if (length(year_ud) >= 2) {
+  year_pairs <- combn(names(year_ud), 2, simplify = FALSE)
+  overlap_table <- purrr::map_dfr(year_pairs, function(pair) {
+    y1 <- pair[1]
+    y2 <- pair[2]
+    ud_list <- list()
+    ud_list[[y1]] <- year_ud[[y1]]
+    ud_list[[y2]] <- year_ud[[y2]]
+
+    ov_bh <- ctmm::overlap(ud_list, method = "Bhattacharyya", level = ci_level, debias = TRUE)
+    ov_en <- ctmm::overlap(ud_list, method = "Encounter", level = ci_level, debias = TRUE)
+
+    bind_rows(
+      extract_overlap_ci(ov_bh, y1, y2) %>% mutate(method = "Bhattacharyya"),
+      extract_overlap_ci(ov_en, y1, y2) %>% mutate(method = "Encounter")
+    ) %>%
+      mutate(year_1 = y1, year_2 = y2, .before = 1)
+  })
+
+  readr::write_csv(overlap_table, file.path(table_dir, "akde_overlap_by_year.csv"))
+}
+```
+
+## 3.6 Statistical support for habitat-use comparison
+```{r akde-tests}
+# Individual-level 95% area comparison (non-parametric, robust for skewed areas).
+akde_area_95 <- akde_area_table %>%
+  dplyr::filter(abs(ud_level - 0.95) < 1e-8) %>%
+  dplyr::select(individual_id, bird_id, year_season, area_estimate)
+
+cliffs_delta <- function(x, y) {
+  # Robust non-parametric effect size: P(x>y) - P(x<y).
+  comp <- outer(x, y, FUN = "-")
+  (sum(comp > 0) - sum(comp < 0)) / (length(x) * length(y))
+}
+
+year_pairs_area <- combn(sort(unique(akde_area_95$year_season)), 2, simplify = FALSE)
+if (length(year_pairs_area) > 0) {
+  area_test_table <- purrr::map_dfr(year_pairs_area, function(pair) {
+    y1 <- pair[1]
+    y2 <- pair[2]
+    x <- akde_area_95 %>% dplyr::filter(year_season == y1) %>% dplyr::pull(area_estimate)
+    y <- akde_area_95 %>% dplyr::filter(year_season == y2) %>% dplyr::pull(area_estimate)
+    wt <- wilcox.test(x, y, exact = FALSE)
+
+    tibble(
+      year_1 = y1,
+      year_2 = y2,
+      n_1 = length(x),
+      n_2 = length(y),
+      median_1 = median(x, na.rm = TRUE),
+      median_2 = median(y, na.rm = TRUE),
+      statistic = as.numeric(wt$statistic),
+      p_value = wt$p.value,
+      cliffs_delta = cliffs_delta(x, y)
+    )
+  }) %>%
+    mutate(p_value_fdr = p.adjust(p_value, method = "fdr"))
+
+  readr::write_csv(area_test_table, file.path(table_dir, "akde_area95_year_wilcox.csv"))
+}
+
+# Bootstrap overlap with equal birds per year (handles unbalanced sample sizes).
+set.seed(123)
+ids_by_year <- id_lookup %>%
+  dplyr::filter(bird_id %in% purrr::map_chr(akde_results, "id")) %>%
+  group_by(year_season) %>%
+  summarise(ids = list(bird_id), .groups = "drop") %>%
+  tibble::deframe()
+
+target_years <- if (all(c("2025", "2026") %in% names(ids_by_year))) c("2025", "2026") else sort(names(ids_by_year))[1:2]
+
+if (length(target_years) == 2 && all(!is.na(target_years))) {
+  y1 <- target_years[1]
+  y2 <- target_years[2]
+  n_equal <- min(length(ids_by_year[[y1]]), length(ids_by_year[[y2]]))
+  ud_lookup_ind <- setNames(purrr::map(akde_results, "ud"), purrr::map_chr(akde_results, "id"))
+
+  overlap_estimate_one <- function(ud_a, ud_b, y_a, y_b) {
+    ud_list <- list()
+    ud_list[[y_a]] <- ud_a
+    ud_list[[y_b]] <- ud_b
+    ov <- ctmm::overlap(ud_list, method = "Bhattacharyya", level = ci_level, debias = TRUE)
+    extract_overlap_ci(ov, y_a, y_b)$overlap_estimate
+  }
+
+  # Observed overlap from full year means.
+  observed_overlap <- NA_real_
+  if (exists("overlap_table")) {
+    observed_overlap <- overlap_table %>%
+      dplyr::filter(year_1 == y1, year_2 == y2, method == "Bhattacharyya") %>%
+      dplyr::pull(overlap_estimate) %>%
+      .[1]
+  }
+  if (is.na(observed_overlap)) {
+    ud_year <- list()
+    ud_year[[y1]] <- mean(ud_lookup_ind[ids_by_year[[y1]]], sample = FALSE)
+    ud_year[[y2]] <- mean(ud_lookup_ind[ids_by_year[[y2]]], sample = FALSE)
+    ov_obs <- ctmm::overlap(ud_year, method = "Bhattacharyya", level = ci_level, debias = TRUE)
+    observed_overlap <- extract_overlap_ci(ov_obs, y1, y2)$overlap_estimate
+  }
+
+  overlap_boot <- replicate(n_overlap_boot, {
+    s1 <- sample(ids_by_year[[y1]], size = n_equal, replace = TRUE)
+    s2 <- sample(ids_by_year[[y2]], size = n_equal, replace = TRUE)
+    ud1 <- mean(ud_lookup_ind[s1], sample = FALSE)
+    ud2 <- mean(ud_lookup_ind[s2], sample = FALSE)
+    overlap_estimate_one(ud1, ud2, y1, y2)
+  })
+
+  # Permutation test (Niella-style random reassignment logic adapted to AKDE overlap):
+  # if observed overlap is lower than null, groups are more spatially segregated than random expectation.
+  n1 <- length(ids_by_year[[y1]])
+  n2 <- length(ids_by_year[[y2]])
+  pooled_ids <- c(ids_by_year[[y1]], ids_by_year[[y2]])
+  overlap_perm <- replicate(n_overlap_perm, {
+    shuffled <- sample(pooled_ids, size = length(pooled_ids), replace = FALSE)
+    g1 <- shuffled[seq_len(n1)]
+    g2 <- shuffled[(n1 + 1):(n1 + n2)]
+    ud1 <- mean(ud_lookup_ind[g1], sample = FALSE)
+    ud2 <- mean(ud_lookup_ind[g2], sample = FALSE)
+    overlap_estimate_one(ud1, ud2, y1, y2)
+  })
+
+  overlap_boot_table <- tibble(overlap = overlap_boot)
+  overlap_boot_summary <- tibble(
+    year_1 = y1,
+    year_2 = y2,
+    n_boot = n_overlap_boot,
+    n_equal_birds = n_equal,
+    observed_overlap = observed_overlap,
+    overlap_median = median(overlap_boot, na.rm = TRUE),
+    overlap_lcl = quantile(overlap_boot, 0.025, na.rm = TRUE),
+    overlap_ucl = quantile(overlap_boot, 0.975, na.rm = TRUE)
+  )
+
+  overlap_perm_table <- tibble(overlap = overlap_perm)
+  overlap_perm_summary <- tibble(
+    year_1 = y1,
+    year_2 = y2,
+    n_perm = n_overlap_perm,
+    n_1 = n1,
+    n_2 = n2,
+    observed_overlap = observed_overlap,
+    null_median = median(overlap_perm, na.rm = TRUE),
+    p_value_lower_tail = mean(overlap_perm <= observed_overlap, na.rm = TRUE),
+    p_value_upper_tail = mean(overlap_perm >= observed_overlap, na.rm = TRUE),
+    p_value_two_sided = 2 * pmin(
+      mean(overlap_perm <= observed_overlap, na.rm = TRUE),
+      mean(overlap_perm >= observed_overlap, na.rm = TRUE)
+    )
+  )
+
+  readr::write_csv(overlap_boot_table, file.path(table_dir, "akde_overlap_bootstrap_samples.csv"))
+  readr::write_csv(overlap_boot_summary, file.path(table_dir, "akde_overlap_bootstrap_summary.csv"))
+  readr::write_csv(overlap_perm_table, file.path(table_dir, "akde_overlap_permutation_samples.csv"))
+  readr::write_csv(overlap_perm_summary, file.path(table_dir, "akde_overlap_permutation_summary.csv"))
+}
+```
+
+```{r mean-akde-plots}
+format_ud_level <- function(x) {
+  x_num <- suppressWarnings(as.numeric(as.character(x)))
+  if (all(is.na(x_num))) return(as.character(x))
+  if (max(x_num, na.rm = TRUE) <= 1) x_num <- x_num * 100
+  paste0(round(x_num), "%")
+}
+
+plot_mean_ud <- function(ud_obj, year_label) {
+  r <- ctmm::raster(ud_obj, DF = "PMF")
+  df <- as.data.frame(raster::rasterToPoints(r))
+  names(df) <- c("x", "y", "pmf")
+
+  ud_crs <- sf::st_crs(raster::projection(r))
+
+  land_sf_plot <- NULL
+  if (!is.null(land_sf_raw)) {
+    land_sf_plot <- sf::st_transform(land_sf_raw, ud_crs)
+  }
+
+  colony_sf_plot <- sf::st_transform(colony_sf_ll, ud_crs)
+
+  contour_path <- file.path(akde_vector_dir, paste0("akde_mean_contours_", year_label, ".gpkg"))
+  contour_sf <- NULL
+  if (file.exists(contour_path)) {
+    contour_sf <- sf::st_read(contour_path, quiet = TRUE)
+    level_col <- names(contour_sf)[grepl("level", names(contour_sf), ignore.case = TRUE)][1]
+    if (!is.na(level_col)) {
+      contour_sf <- contour_sf %>%
+        mutate(ud_level_label = format_ud_level(.data[[level_col]]))
+    }
+  }
+
+  p <- ggplot(df, aes(x = x, y = y, fill = pmf)) +
+    geom_raster(interpolate = FALSE) +
+    geom_contour(
+      data = df,
+      aes(x = x, y = y, z = pmf),
+      inherit.aes = FALSE,
+      bins = 10,
+      colour = "white",
+      alpha = 0.35,
+      linewidth = 0.2
+    ) +
+    scale_fill_viridis_c(option = map_palette, trans = "sqrt") +
+    coord_sf(datum = NA) +
+    labs(
+      title = paste("Mean autocorrelation-aware UD (AKDE) -", year_label),
+      x = "Projected X",
+      y = "Projected Y",
+      fill = "Use intensity"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      panel.grid.major = element_line(colour = "grey85", linewidth = 0.2),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "#dff0fa", colour = NA)
+    )
+
+  if (!is.null(land_sf_plot)) {
+    p <- p +
+      geom_sf(data = land_sf_plot, inherit.aes = FALSE, fill = "grey88", colour = "grey35", linewidth = 0.25)
+  }
+
+  if (!is.null(contour_sf)) {
+    if ("ud_level_label" %in% names(contour_sf)) {
+      p <- p +
+        geom_sf(
+          data = contour_sf,
+          aes(colour = ud_level_label),
+          inherit.aes = FALSE,
+          fill = NA,
+          linewidth = 0.75,
+          alpha = 0.85
+        ) +
+        scale_colour_manual(
+          values = c("50%" = "#cc4c02", "75%" = "#fe9929", "95%" = "#fec44f"),
+          name = "UD contour"
+        )
+    } else {
+      p <- p +
+        geom_sf(
+          data = contour_sf,
+          inherit.aes = FALSE,
+          fill = NA,
+          colour = "black",
+          linewidth = 0.5,
+          alpha = 0.85
+        )
+    }
+  }
+
+  p <- p +
+    geom_sf(
+      data = colony_sf_plot,
+      inherit.aes = FALSE,
+      shape = 21,
+      size = 2.5,
+      fill = "gold",
+      colour = "black",
+      stroke = 0.4
+    )
+
+  p
+}
+
+for (yy in names(year_ud)) {
+  p <- plot_mean_ud(year_ud[[yy]], yy)
+  ggsave(file.path(fig_dir, paste0("fig_akde_mean_ud_", yy, ".png")), p, width = 8, height = 6, dpi = 300)
+}
+
+# Faceted year map with identical colour scale for direct visual comparison.
+mean_ud_df <- purrr::imap_dfr(year_ud, function(ud_obj, yy) {
+  r <- ctmm::raster(ud_obj, DF = "PMF")
+  out <- as.data.frame(raster::rasterToPoints(r))
+  names(out) <- c("x", "y", "pmf")
+  out$year_season <- yy
+  out
+})
+
+if (nrow(mean_ud_df) > 0) {
+  facet_coord <- if (!is.null(land_sf_raw)) coord_sf(datum = NA) else coord_equal()
+  fig_mean_ud_facet <- ggplot(mean_ud_df, aes(x = x, y = y, fill = pmf)) +
+    geom_raster(interpolate = FALSE) +
+    scale_fill_viridis_c(option = map_palette, trans = "sqrt") +
+    facet_wrap(~year_season, ncol = 2) +
+    facet_coord +
+    labs(
+      title = "Year-level AKDE habitat use comparison",
+      subtitle = "Shared scale across panels; PMF from autocorrelation-aware AKDE",
+      x = "Projected X",
+      y = "Projected Y",
+      fill = "Use intensity"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      panel.grid.major = element_line(colour = "grey85", linewidth = 0.2),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "#dff0fa", colour = NA)
+    )
+
+  if (!is.null(land_sf_raw)) {
+    ud_crs_facet <- sf::st_crs(raster::projection(ctmm::raster(year_ud[[1]], DF = "PMF")))
+    land_sf_facet <- sf::st_transform(land_sf_raw, ud_crs_facet)
+    fig_mean_ud_facet <- fig_mean_ud_facet +
+      geom_sf(data = land_sf_facet, inherit.aes = FALSE, fill = "grey88", colour = "grey35", linewidth = 0.25)
+  }
+
+  ggsave(
+    file.path(fig_dir, "fig_akde_mean_ud_by_year_facet.png"),
+    fig_mean_ud_facet,
+    width = 10,
+    height = 6,
+    dpi = 300
+  )
+}
+
+# Contour-only comparison map (common publication style in seabird foraging papers).
+year_contour_list <- purrr::imap(year_ud, function(.ud, yy) {
+  contour_path <- file.path(akde_vector_dir, paste0("akde_mean_contours_", yy, ".gpkg"))
+  if (!file.exists(contour_path)) return(NULL)
+  sf_obj <- sf::st_read(contour_path, quiet = TRUE)
+  level_col <- names(sf_obj)[grepl("level", names(sf_obj), ignore.case = TRUE)][1]
+  if (!is.na(level_col)) {
+    sf_obj <- sf_obj %>% mutate(ud_level_label = format_ud_level(.data[[level_col]]))
+  }
+  sf_obj$year_season <- yy
+  sf_obj
+})
+
+year_contour_list <- year_contour_list[!vapply(year_contour_list, is.null, logical(1))]
+year_contours <- if (length(year_contour_list) > 0) do.call(rbind, year_contour_list) else NULL
+
+if (!is.null(year_contours) && nrow(year_contours) > 0) {
+  ud_crs_cont <- sf::st_crs(year_contours)
+  colony_sf_cont <- sf::st_transform(colony_sf_ll, ud_crs_cont)
+  fig_contours <- ggplot() +
+    theme_minimal(base_size = 11) +
+    theme(
+      panel.grid.major = element_line(colour = "grey85", linewidth = 0.2),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "#dff0fa", colour = NA)
+    ) +
+    labs(
+      title = "AKDE contour comparison by year",
+      subtitle = "Contour rings represent 50%, 75% and 95% utilization distributions",
+      x = "Projected X",
+      y = "Projected Y",
+      colour = "Year"
+    ) +
+    coord_sf(datum = NA)
+
+  if (!is.null(land_sf_raw)) {
+    land_sf_cont <- sf::st_transform(land_sf_raw, ud_crs_cont)
+    fig_contours <- fig_contours +
+      geom_sf(data = land_sf_cont, fill = "grey88", colour = "grey35", linewidth = 0.25)
+  }
+
+  if ("ud_level_label" %in% names(year_contours)) {
+    fig_contours <- fig_contours +
+      geom_sf(
+        data = year_contours,
+        aes(colour = year_season, linetype = ud_level_label),
+        fill = NA,
+        linewidth = 0.8,
+        alpha = 0.9
+      ) +
+      scale_linetype_discrete(name = "UD contour")
+  } else {
+    fig_contours <- fig_contours +
+      geom_sf(
+        data = year_contours,
+        aes(colour = year_season),
+        fill = NA,
+        linewidth = 0.8,
+        alpha = 0.9
+      )
+  }
+
+  fig_contours <- fig_contours +
+    geom_sf(
+      data = colony_sf_cont,
+      shape = 21,
+      size = 2.8,
+      fill = "gold",
+      colour = "black",
+      stroke = 0.4
+    )
+
+  ggsave(
+    file.path(fig_dir, "fig_akde_contour_comparison_by_year.png"),
+    fig_contours,
+    width = 9,
+    height = 6,
+    dpi = 300
+  )
+}
+```
+
+```{r overlap-bootstrap-plot}
+if (exists("overlap_boot_table") && nrow(overlap_boot_table) > 0) {
+  fig_overlap_boot <- ggplot(overlap_boot_table, aes(x = overlap)) +
+    geom_histogram(bins = 30, fill = "#2c7fb8", alpha = 0.8, colour = "white") +
+    geom_vline(
+      xintercept = overlap_boot_summary$overlap_median,
+      colour = "firebrick",
+      linewidth = 0.8
+    ) +
+    geom_vline(
+      xintercept = overlap_boot_summary$observed_overlap,
+      colour = "black",
+      linewidth = 0.8,
+      linetype = "dashed"
+    ) +
+    labs(
+      title = "Bootstrap distribution of year-overlap in habitat use",
+      subtitle = "Equal-bird bootstrap across years using AKDE mean-UD overlap",
+      x = paste0("Overlap (", overlap_boot_summary$year_1, " vs ", overlap_boot_summary$year_2, ")"),
+      y = "Bootstrap frequency"
+    ) +
+    theme_minimal()
+
+  fig_overlap_boot
+
+  ggsave(
+    file.path(fig_dir, "fig_akde_overlap_bootstrap_histogram.png"),
+    fig_overlap_boot,
+    width = 8,
+    height = 5,
+    dpi = 300
+  )
+}
+
+if (exists("overlap_perm_table") && nrow(overlap_perm_table) > 0) {
+  fig_overlap_perm <- ggplot(overlap_perm_table, aes(x = overlap)) +
+    geom_histogram(bins = 30, fill = "#969696", alpha = 0.9, colour = "white") +
+    geom_vline(
+      xintercept = overlap_perm_summary$observed_overlap,
+      colour = "#cb181d",
+      linewidth = 0.9
+    ) +
+    labs(
+      title = "Permutation null distribution of overlap",
+      subtitle = "Observed overlap (red) vs random year-label reassignment null",
+      x = "Bhattacharyya overlap",
+      y = "Permutation frequency"
+    ) +
+    theme_minimal()
+
+  ggsave(
+    file.path(fig_dir, "fig_akde_overlap_permutation_histogram.png"),
+    fig_overlap_perm,
+    width = 8,
+    height = 5,
+    dpi = 300
+  )
+}
+```
+
+# 4. Environmental covariates with autocorrelation-aware iRSF
+Put environmental raster covariates (`.tif`) into:
+
+`r env_input_dir`
+
+Typical candidates:
+- bathymetry/depth
+- slope
+- SST
+- chlorophyll-a
+- distance to colony / distance to shelf break
+
+```{r load-env}
+env_files <- list.files(env_input_dir, pattern = "\\.tif$", full.names = TRUE)
+
+if (length(env_files) == 0) {
+  warning(
+    paste0(
+      "No environmental .tif files found in ", env_input_dir,
+      ". Add raster covariates, then rerun section 4."
+    )
+  )
+} else {
+  # Use projection from the first telemetry object as target.
+  target_proj <- ctmm::projection(akde_results[[1]]$ud)
+
+  env_terra <- setNames(lapply(env_files, terra::rast), tools::file_path_sans_ext(basename(env_files)))
+
+  env_projected <- purrr::imap(env_terra, function(r, nm) {
+    r_proj <- terra::project(r, target_proj, method = "bilinear")
+    terra::writeRaster(r_proj, file.path(env_projected_dir, paste0(nm, "_projected.tif")), overwrite = TRUE)
+    raster::raster(r_proj)
+  })
+
+  env_raster_list <- env_projected
+  env_names <- names(env_raster_list)
+
+  rsf_formula <- as.formula(paste("~", paste(env_names, collapse = " + ")))
+  rsf_formula
+}
+```
+
+```{r fit-rsf, eval=TRUE}
+if (exists("env_raster_list")) {
+  fit_rsf_one <- function(res) {
+    rsf_fit <- ctmm::rsf.fit(
+      data = telemetry_list[[res$id]],
+      UD = res$ud,
+      R = env_raster_list,
+      formula = rsf_formula,
+      integrated = TRUE,
+      trace = TRUE
+    )
+
+    id_safe <- make.names(res$id)
+    saveRDS(rsf_fit, file.path(model_dir, paste0("irsf_", id_safe, ".rds")))
+
+    co <- tryCatch(stats::coef(rsf_fit), error = function(e) NULL)
+    if (is.null(co)) {
+      return(tibble(bird_id = res$id, term = NA_character_, estimate = NA_real_))
+    }
+
+    tibble(
+      bird_id = res$id,
+      year_season = unname(id_year_lookup[[res$id]]),
+      term = names(co),
+      estimate = as.numeric(co)
+    )
+  }
+
+  rsf_coef_table <- purrr::map_dfr(akde_results, ~purrr::possibly(fit_rsf_one, otherwise = NULL)(.x)) %>%
+    dplyr::filter(!is.na(term))
+
+  readr::write_csv(rsf_coef_table, file.path(table_dir, "irsf_coefficients_by_individual.csv"))
+
+  rsf_coef_summary <- rsf_coef_table %>%
+    group_by(year_season, term) %>%
+    summarise(
+      n_individuals = n(),
+      median_estimate = median(estimate, na.rm = TRUE),
+      q1_estimate = quantile(estimate, 0.25, na.rm = TRUE),
+      q3_estimate = quantile(estimate, 0.75, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  readr::write_csv(rsf_coef_summary, file.path(table_dir, "irsf_coefficients_summary_by_year.csv"))
+
+  # One-sample tests: does each coefficient differ from 0 within each year?
+  rsf_within_year_tests <- rsf_coef_table %>%
+    group_by(year_season, term) %>%
+    summarise(
+      n_individuals = n(),
+      median_estimate = median(estimate, na.rm = TRUE),
+      p_value_wilcox_vs0 = tryCatch(wilcox.test(estimate, mu = 0, exact = FALSE)$p.value, error = function(e) NA_real_),
+      .groups = "drop"
+    ) %>%
+    mutate(p_value_fdr = p.adjust(p_value_wilcox_vs0, method = "fdr"))
+
+  readr::write_csv(rsf_within_year_tests, file.path(table_dir, "irsf_within_year_wilcox_vs0.csv"))
+
+  # Between-year tests per coefficient (if both years available).
+  if (length(unique(rsf_coef_table$year_season)) >= 2) {
+    rsf_year_pair <- if (all(c("2025", "2026") %in% unique(rsf_coef_table$year_season))) {
+      c("2025", "2026")
+    } else {
+      sort(unique(rsf_coef_table$year_season))[1:2]
+    }
+    y1 <- rsf_year_pair[1]
+    y2 <- rsf_year_pair[2]
+
+    rsf_between_year_tests <- rsf_coef_table %>%
+      dplyr::filter(year_season %in% c(y1, y2)) %>%
+      group_by(term) %>%
+      group_modify(~{
+        d <- .x
+        tibble(
+          n_1 = sum(d$year_season == y1),
+          n_2 = sum(d$year_season == y2),
+          median_1 = median(d$estimate[d$year_season == y1], na.rm = TRUE),
+          median_2 = median(d$estimate[d$year_season == y2], na.rm = TRUE),
+          p_value_wilcox_between_years = tryCatch(
+            wilcox.test(estimate ~ year_season, data = d, exact = FALSE)$p.value,
+            error = function(e) NA_real_
+          )
+        )
+      }) %>%
+      ungroup() %>%
+      mutate(
+        year_1 = y1,
+        year_2 = y2,
+        p_value_fdr = p.adjust(p_value_wilcox_between_years, method = "fdr"),
+        .before = 1
+      )
+
+    readr::write_csv(rsf_between_year_tests, file.path(table_dir, "irsf_between_year_wilcox.csv"))
+  }
+}
+```
+
+## 4.1 Plot iRSF coefficient summaries
+```{r rsf-coef-plot}
+if (exists("rsf_coef_summary") && nrow(rsf_coef_summary) > 0) {
+  fig_rsf_coef <- ggplot(
+    rsf_coef_summary,
+    aes(x = median_estimate, y = term, xmin = q1_estimate, xmax = q3_estimate, colour = year_season)
+  ) +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+    geom_pointrange(position = position_dodge(width = 0.5)) +
+    labs(
+      title = "Autocorrelation-aware iRSF coefficients",
+      subtitle = "Points are medians across individuals; bars are interquartile ranges",
+      x = "Coefficient estimate",
+      y = "Environmental covariate",
+      colour = "Year"
+    ) +
+    theme_minimal()
+
+  fig_rsf_coef
+
+  ggsave(file.path(fig_dir, "fig_irsf_coefficients_by_year.png"), fig_rsf_coef, width = 9, height = 6, dpi = 300)
+}
+```
+
+# 5. Notes for interpretation
+- If sampling interval differs between years, report it explicitly.
+- AKDE and iRSF here account for autocorrelation more rigorously than IID KDE + naive GLM.
+- If you need strict comparability with mIBA/track2KBA outputs for policy workflows, run a parallel track2KBA KDE analysis as a sensitivity check.
+- Runtime in section 3.3 is driven mostly by model selection (`ctmm.select`), weighted AKDE, and raster resolution; for exploratory runs use the default fast settings in section 1.3, then switch to slower robust settings for final analyses.
+
+# 6. Reporting scaffold (Methods + Results text helper)
+```{r reporting-scaffold}
+fmt_num <- function(x, digits = 3) {
+  ifelse(is.na(x), "NA", formatC(x, digits = digits, format = "f"))
+}
+
+methods_lines <- c(
+  "Habitat use was quantified from at-sea GPS locations using autocorrelation-aware kernel density estimation (AKDE) in the ctmm framework.",
+  "Individual movement models were fit from telemetry variograms and used to derive individual AKDE utilization distributions (UDs).",
+  "Year-level mean UDs were obtained from individual UDs, and overlap between years was estimated using Bhattacharyya and encounter overlap metrics with uncertainty propagated by ctmm.",
+  "To account for unbalanced sample sizes between years, overlap uncertainty and segregation strength were assessed with equal-bird bootstrap and year-label permutation procedures.",
+  "Year differences in individual 95% AKDE area were tested with Wilcoxon rank-sum tests and effect sizes reported as Cliff's delta."
+)
+
+results_lines <- c("Run the analysis first to populate result tables.")
+
+ov_path <- file.path(table_dir, "akde_overlap_by_year.csv")
+ov_perm_path <- file.path(table_dir, "akde_overlap_permutation_summary.csv")
+area_path <- file.path(table_dir, "akde_area95_year_wilcox.csv")
+
+if (file.exists(ov_path) && file.exists(ov_perm_path) && file.exists(area_path)) {
+  ov <- readr::read_csv(ov_path, show_col_types = FALSE)
+  ov_perm <- readr::read_csv(ov_perm_path, show_col_types = FALSE)
+  area <- readr::read_csv(area_path, show_col_types = FALSE)
+
+  ov_bh <- ov %>% dplyr::filter(method == "Bhattacharyya") %>% dplyr::slice(1)
+  ov_en <- ov %>% dplyr::filter(method == "Encounter") %>% dplyr::slice(1)
+  area_1 <- area %>% dplyr::slice(1)
+  perm_1 <- ov_perm %>% dplyr::slice(1)
+
+  results_lines <- c(
+    paste0(
+      "Year-level Bhattacharyya overlap was ",
+      fmt_num(ov_bh$overlap_estimate),
+      " (",
+      fmt_num(ov_bh$overlap_low),
+      "-",
+      fmt_num(ov_bh$overlap_high),
+      "), and encounter overlap was ",
+      fmt_num(ov_en$overlap_estimate),
+      " (",
+      fmt_num(ov_en$overlap_low),
+      "-",
+      fmt_num(ov_en$overlap_high),
+      ")."
+    ),
+    paste0(
+      "Permutation testing gave p(lower-tail) = ",
+      fmt_num(perm_1$p_value_lower_tail, digits = 4),
+      " for overlap lower than null expectation."
+    ),
+    paste0(
+      "Individual 95% AKDE area comparison (",
+      area_1$year_1, " vs ", area_1$year_2,
+      ") gave W = ",
+      fmt_num(area_1$statistic, digits = 0),
+      ", p = ",
+      fmt_num(area_1$p_value, digits = 4),
+      ", Cliff's delta = ",
+      fmt_num(area_1$cliffs_delta, digits = 3),
+      "."
+    )
+  )
+}
+
+report_lines <- c(
+  "METHODS (draft):",
+  methods_lines,
+  "",
+  "RESULTS (draft):",
+  results_lines
+)
+
+writeLines(report_lines, file.path(table_dir, "manuscript_methods_results_draft.txt"))
+cat(paste(report_lines, collapse = "\n"), "\n")
+```
+
+# End
+```{r end}
+cat("05_habitat_use_kde_environment script completed.\n")
+cat("Outputs directory:", output_dir, "\n")
+```
